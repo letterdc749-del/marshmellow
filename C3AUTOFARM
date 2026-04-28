@@ -345,6 +345,7 @@ end
 
 -- ── PERSISTENT MARSHMALLOW WATCHER ────────────────────────────
 local selling = false -- true while doSell is running, blocks watcher
+local seenBags = {} -- track bag instances we've already counted
 
 local function onMSAdded(item)
     if not item:IsA("Tool") then return end
@@ -352,13 +353,19 @@ local function onMSAdded(item)
     if not (n:find("marshmallow") or n:find("marsh")) then return end
     if farmEnabled then return end -- farm handles its own counting
     if selling then return end     -- ignore items moving around during sell
+    if seenBags[item] then return end -- already counted this bag
+    seenBags[item]=true
+    -- clean up when bag is removed
+    item.AncestryChanged:Connect(function()
+        if not item:IsDescendantOf(game) then seenBags[item]=nil end
+    end)
     local size = getSizeFromName(item.Name)
     if size=="Large" then stats.large+=1
     elseif size=="Medium" then stats.medium+=1
     else stats.small+=1 end
     stats.batches+=1
     logBatch(size)
-    setStatus("✅ Got "..size.." MS! ("..item.Name..")")
+    setStatus("got "..size:lower().." ms!")
 end
 
 LP.Backpack.ChildAdded:Connect(onMSAdded)
@@ -494,7 +501,6 @@ local function doCook()
         stats.small+=1; logBatch("?")
     end
 
-    stats.batches+=1
     -- Track average cook time
     if stats.cookStart then
         stats.totalCookSecs += tick()-stats.cookStart
@@ -503,7 +509,8 @@ local function doCook()
     stats.cookStart=nil
 
     -- Discord webhook every N batches
-    if stats.batches%CFG.webhookBatches==0 then
+    local _wb=stats.small+stats.medium+stats.large
+    if _wb>0 and _wb%CFG.webhookBatches==0 then
         sendWebhook("🍡 "..stats.batches.." batches done!")
     end
 
@@ -524,7 +531,7 @@ doSell = function()
         local itemName=item.Name
         local sz=getSizeFromName(itemName)
         local price=PRICES[sz] or PRICES.Small
-        -- Equip the item
+        -- Equip
         local hum=LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
         if item.Parent~=LP.Character and hum then
             pcall(function() hum:EquipTool(item) end)
@@ -534,12 +541,13 @@ doSell = function()
             pcall(function() item.Parent=LP.Character end)
             task.wait(0.1)
         end
-        local countBefore=countMarshmallowInv()
+        -- Count TOTAL bags before E press (backpack + char combined)
+        local totalBefore2=countMarshmallowInv()
         pressE()
-        task.wait(0.35)
-        local countAfter=countMarshmallowInv()
-        -- Only credit if bag actually left inventory
-        if countAfter < countBefore then
+        task.wait(0.5)
+        local totalAfter2=countMarshmallowInv()
+        -- Bag successfully sold if total went down
+        if totalAfter2 < totalBefore2 then
             stats.earned+=price
             sold+=1
         end
@@ -1801,7 +1809,6 @@ task.spawn(function()
                     if size=="Large" then stats.large+=1
                     elseif size=="Medium" then stats.medium+=1
                     else stats.small+=1 end
-                    stats.batches+=1
                 end
             end
         end
@@ -1852,7 +1859,9 @@ task.spawn(function()
         setStatLabel("medium",stats.medium)
         setStatLabel("large",stats.large)
         -- mini stats
-        if miniStatLabels["batches"] then miniStatLabels["batches"].Text=tostring(stats.batches) end
+        local _b=stats.small+stats.medium+stats.large
+        stats.batches=_b
+        if miniStatLabels["batches"] then miniStatLabels["batches"].Text=tostring(_b) end
         if miniStatLabels["earned"]  then miniStatLabels["earned"].Text="$"..tostring(stats.earned) end
         if miniStatLabels["inbag"]   then miniStatLabels["inbag"].Text=tostring(countMarshmallowInv()) end
         if miniStatLabels["failed"]  then miniStatLabels["failed"].Text=tostring(stats.failed) end

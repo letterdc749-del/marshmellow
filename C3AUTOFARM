@@ -1791,12 +1791,16 @@ LP.Backpack.ChildAdded:Connect(function() task.wait(0.5); refreshInv() end)
 LP.Backpack.ChildRemoved:Connect(function() task.wait(0.8); refreshInv() end)
 task.spawn(function()
     task.wait(0.5); refreshInv()
-    -- startup scan — count existing bags into batches only
+    -- startup scan — count existing bags into small/medium/large/batches
     local function scan(c) if not c then return end
         for _,v in ipairs(c:GetChildren()) do
             if v:IsA("Tool") then
                 local n=v.Name:lower()
                 if n:find("marshmallow") or n:find("marsh") then
+                    local size=getSizeFromName(v.Name)
+                    if size=="Large" then stats.large+=1
+                    elseif size=="Medium" then stats.medium+=1
+                    else stats.small+=1 end
                     stats.batches+=1
                 end
             end

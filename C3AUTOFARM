@@ -46,7 +46,7 @@ local SELLER_POS   = Vector3.new(510.0, 4.0, 601.0)
 local COOK_POS     = Vector3.new(510.0, 4.0, 601.0) -- update if needed
 local savedCookPos = nil -- saved automatically when farm starts
 local WIN_W        = 290
-local PRICES       = {Small=1470, Medium=2840, Large=4150}
+local PRICES       = {Small=50, Medium=100, Large=200}
 local ITEM_COSTS   = {Water=20, ["Sugar Block Bag"]=100, Gelatin=70}
 local WEBHOOK_URL  = "" -- set via GUI
 
@@ -344,27 +344,21 @@ local function logBatch(size)
 end
 
 -- ── PERSISTENT MARSHMALLOW WATCHER ────────────────────────────
-local selling = false
-local seenBags = {}
+local selling = false -- true while doSell is running, blocks watcher
 
 local function onMSAdded(item)
     if not item:IsA("Tool") then return end
     local n=item.Name:lower()
     if not (n:find("marshmallow") or n:find("marsh")) then return end
-    if selling then return end
-    if seenBags[item] then return end
-    seenBags[item]=true
-    item.AncestryChanged:Connect(function()
-        if not item:IsDescendantOf(game) then seenBags[item]=nil end
-    end)
-    local size=getSizeFromName(item.Name)
+    if farmEnabled then return end -- farm handles its own counting
+    if selling then return end     -- ignore items moving around during sell
+    local size = getSizeFromName(item.Name)
     if size=="Large" then stats.large+=1
     elseif size=="Medium" then stats.medium+=1
     else stats.small+=1 end
-    -- batches always = total bags cooked/collected
-    stats.batches=stats.small+stats.medium+stats.large
+    stats.batches+=1
     logBatch(size)
-    setStatus("got "..size:lower().." ms!")
+    setStatus("✅ Got "..size.." MS! ("..item.Name..")")
 end
 
 LP.Backpack.ChildAdded:Connect(onMSAdded)
@@ -492,17 +486,15 @@ local function doCook()
         if gotSize=="Large" then stats.large+=1
         elseif gotSize=="Medium" then stats.medium+=1
         else stats.small+=1 end
-        stats.batches=stats.small+stats.medium+stats.large
         logBatch(gotSize)
-        task.wait(0.5)
-        setStatus("got "..gotSize:lower().." ms!")
+        task.wait(0.5) -- wait for marshmallow to actually land in backpack
+        setStatus("✅ Got "..gotSize.." MS!")
     else
-        setStatus("collected (unknown size)")
-        stats.small+=1
-        stats.batches=stats.small+stats.medium+stats.large
-        logBatch("?")
+        setStatus("⚠ Collected (unknown size)")
+        stats.small+=1; logBatch("?")
     end
 
+    stats.batches+=1
     -- Track average cook time
     if stats.cookStart then
         stats.totalCookSecs += tick()-stats.cookStart
@@ -511,8 +503,7 @@ local function doCook()
     stats.cookStart=nil
 
     -- Discord webhook every N batches
-    local _wb=stats.small+stats.medium+stats.large
-    if _wb>0 and _wb%CFG.webhookBatches==0 then
+    if stats.batches%CFG.webhookBatches==0 then
         sendWebhook("🍡 "..stats.batches.." batches done!")
     end
 
@@ -521,50 +512,35 @@ end
 
 -- ── SELL ──────────────────────────────────────────────────────
 doSell = function()
-    local bags=getMarshmallows()
-    if #bags==0 then setStatus("nothing to sell"); return end
-    selling=true
+    local totalBefore=countMarshmallowInv()
+    if totalBefore==0 then setStatus("Nothing to sell"); return end
+    selling = true -- block watcher
     directTP(SELLER_POS); task.wait(0.6)
-    local soldCount=0
-    local earnedThisSell=0
-
-    -- sell one bag at a time, track by watching if it leaves the game
-    local toSell=getMarshmallows()
-    for _,item in ipairs(toSell) do
-        if not item:IsDescendantOf(game) then continue end
-        local sz=getSizeFromName(item.Name)
-        local price=PRICES[sz] or PRICES.Small
-        -- equip
+    local sold=0
+    local ms=getMarshmallows()
+    while #ms>0 do
+        local item=ms[1]
+        -- Equip the item
         local hum=LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-        if hum and item.Parent~=LP.Character then
+        if item.Parent~=LP.Character and hum then
             pcall(function() hum:EquipTool(item) end)
-            task.wait(0.15)
+            task.wait(0.1) -- reduced from 0.3
         end
-        -- press E and wait for item to leave the game entirely
-        pressE()
-        local gone=false
-        for _=1,10 do
+        -- Force parent if equip failed
+        if item.Parent~=LP.Character then
+            pcall(function() item.Parent=LP.Character end)
             task.wait(0.1)
-            if not item:IsDescendantOf(game) then gone=true; break end
         end
-        if gone then
-            stats.earned+=price
-            earnedThisSell+=price
-            soldCount+=1
-            -- subtract from size counts and sync batches
-            if sz=="Large" then stats.large=math.max(0,stats.large-1)
-            elseif sz=="Medium" then stats.medium=math.max(0,stats.medium-1)
-            else stats.small=math.max(0,stats.small-1) end
-            stats.batches=stats.small+stats.medium+stats.large
-            pushLog("sold "..sz:lower().." ms  +$"..price)
-            setStatus("sold "..sz:lower().." ms +$"..price)
-        end
-        task.wait(0.1)
+        pressE()
+        task.wait(0.35) -- reduced from 1s — server needs a moment but not a full second
+        sold+=1
+        ms=getMarshmallows()
+        if not farmEnabled and sold>0 then break end
     end
-
+    local actuallySold=totalBefore-countMarshmallowInv()
+    setStatus("Sold "..actuallySold.." MS")
     unequipAll()
-    selling=false
-    setStatus("sold "..soldCount.." bag"..(soldCount~=1 and "s" or "").." +$"..earnedThisSell)
+    selling = false -- allow watcher again
 end
 
 -- ── BUY ───────────────────────────────────────────────────────
@@ -736,443 +712,61 @@ UIS.InputBegan:Connect(function(inp,gpe)
     end
 end)
 
-
 -- ── GUI ───────────────────────────────────────────────────────
-local WIN_W = 280
+local WIN_W = 210
 
--- Theme
-local C = {
-    bg      = Color3.fromRGB(13,13,15),
-    surf    = Color3.fromRGB(19,19,22),
-    card    = Color3.fromRGB(24,24,28),
-    border  = Color3.fromRGB(38,38,44),
-    acc     = Color3.fromRGB(190,140,20),
-    accDim  = Color3.fromRGB(100,72,8),
-    txt     = Color3.fromRGB(205,205,210),
-    sub     = Color3.fromRGB(110,110,118),
-    mute    = Color3.fromRGB(58,58,65),
-    green   = Color3.fromRGB(46,180,82),
-    red     = Color3.fromRGB(185,32,32),
-    blue    = Color3.fromRGB(60,120,210),
-    yellow  = Color3.fromRGB(230,190,50),
-    orange  = Color3.fromRGB(200,100,20),
-    white   = Color3.new(1,1,1),
-}
+local BG     = Color3.fromRGB(24,24,26)
+local DKBG   = Color3.fromRGB(16,16,18)
+local WHITE  = Color3.new(1,1,1)
+local CYAN   = Color3.fromRGB(100,220,255)
+local YELLOW = Color3.fromRGB(255,220,60)
+local LGREEN = Color3.fromRGB(160,255,160)
+local LBLUE  = Color3.fromRGB(160,190,255)
+local WARN   = Color3.fromRGB(255,160,50)
+local GREEN  = Color3.fromRGB(0,170,0)
+local RED    = Color3.fromRGB(190,30,30)
+local BLUE   = Color3.fromRGB(0,100,200)
+local ORANGE = Color3.fromRGB(200,100,0)
+local PURPLE = Color3.fromRGB(110,0,180)
+local TEAL   = Color3.fromRGB(0,140,140)
+local DKGREY = Color3.fromRGB(45,45,50)
+local MUTE   = Color3.fromRGB(110,110,120)
 
--- ── HELPERS ───────────────────────────────────────────────────
-local function frame(parent,props)
-    local f=Instance.new("Frame",parent)
-    for k,v in pairs(props) do pcall(function() f[k]=v end) end
-    return f
-end
+-- Main window
+local Main = Instance.new("Frame", SG)
+Main.Name="Main"; Main.Active=true
+Main.Size=UDim2.new(0,WIN_W,0,520)
+Main.Position=UDim2.new(0.5,-WIN_W/2,0.5,-260)
+Main.BackgroundColor3=BG; Main.BorderSizePixel=1
+Main.BorderColor3=Color3.fromRGB(50,50,55)
+Main.ClipsDescendants=true
 
-local function lbl(parent,props)
-    local l=Instance.new("TextLabel",parent)
-    l.Font=Enum.Font.Code; l.BackgroundTransparency=1
-    l.TextXAlignment=Enum.TextXAlignment.Left
-    for k,v in pairs(props) do pcall(function() l[k]=v end) end
-    return l
-end
-
-local function btn(parent,props,onClick)
-    local b=Instance.new("TextButton",parent)
-    b.Font=Enum.Font.Code; b.AutoButtonColor=false
-    b.BorderSizePixel=0; b.TextXAlignment=Enum.TextXAlignment.Center
-    for k,v in pairs(props) do pcall(function() b[k]=v end) end
-    if onClick then b.MouseButton1Click:Connect(onClick) end
-    return b
-end
-
-local function addPad(parent,l,r,t,bo)
-    local p=Instance.new("UIPadding",parent)
-    p.PaddingLeft=UDim.new(0,l or 0); p.PaddingRight=UDim.new(0,r or 0)
-    p.PaddingTop=UDim.new(0,t or 0); p.PaddingBottom=UDim.new(0,bo or 0)
-end
-
-local function addList(parent,pad,dir)
-    local l=Instance.new("UIListLayout",parent)
-    l.SortOrder=Enum.SortOrder.LayoutOrder
-    l.Padding=UDim.new(0,pad or 0)
-    l.FillDirection=dir or Enum.FillDirection.Vertical
-    return l
-end
-
-local function corner(parent,r)
-    Instance.new("UICorner",parent).CornerRadius=UDim.new(0,r or 4)
-end
-
-local function divider(parent,order)
-    local d=frame(parent,{
-        Size=UDim2.new(1,0,0,1),
-        BackgroundColor3=C.border,
-        BorderSizePixel=0,
-        LayoutOrder=order
-    })
-    return d
-end
-
--- Section header
-local function sectionHeader(parent,text,order)
-    local f=frame(parent,{
-        Size=UDim2.new(1,0,0,18),
-        BackgroundTransparency=1,
-        LayoutOrder=order
-    })
-    lbl(f,{
-        Text=text:upper(),
-        TextSize=9,
-        TextColor3=C.sub,
-        Size=UDim2.new(1,-8,1,0),
-        Position=UDim2.new(0,8,0,0),
-    })
-    -- accent line
-    frame(f,{
-        Size=UDim2.new(1,0,0,1),
-        Position=UDim2.new(0,0,1,-1),
-        BackgroundColor3=C.mute,
-        BorderSizePixel=0,
-    })
-    return f
-end
-
--- Card container
-local function card(parent,order)
-    local f=frame(parent,{
-        Size=UDim2.new(1,0,0,0),
-        AutomaticSize=Enum.AutomaticSize.Y,
-        BackgroundColor3=C.card,
-        BorderSizePixel=1,
-        BorderColor3=C.border,
-        LayoutOrder=order,
-    })
-    corner(f,6)
-    return f
-end
-
--- Stat row inside a card: "label" left, "value" right
-local statLabels = {}
-local function statRow(parent,key,labelText,valText,valCol,order)
-    local row=frame(parent,{
-        Size=UDim2.new(1,0,0,18),
-        BackgroundTransparency=1,
-        LayoutOrder=order,
-    })
-    lbl(row,{
-        Text=labelText,
-        TextSize=10,
-        TextColor3=C.sub,
-        Size=UDim2.new(0.52,0,1,0),
-        Position=UDim2.new(0,10,0,0),
-    })
-    local v=lbl(row,{
-        Text=valText or "--",
-        TextSize=10,
-        TextColor3=valCol or C.txt,
-        Size=UDim2.new(0.48,-10,1,0),
-        Position=UDim2.new(0.52,0,0,0),
-        TextXAlignment=Enum.TextXAlignment.Right,
-    })
-    if key then statLabels[key]=v end
-    return row
-end
-
--- Mini stat tile (2-col grid)
-local miniStatLabels={}
-local function miniStat(parent,key,labelText,valText,valCol)
-    local f=frame(parent,{
-        Size=UDim2.new(0.5,-2,0,44),
-        BackgroundColor3=C.surf,
-        BorderSizePixel=1,
-        BorderColor3=C.border,
-    })
-    corner(f,5)
-    lbl(f,{
-        Text=valText or "0",
-        TextSize=16,
-        TextColor3=valCol or C.txt,
-        Font=Enum.Font.Code,
-        Size=UDim2.new(1,0,0,24),
-        Position=UDim2.new(0,0,0,6),
-        TextXAlignment=Enum.TextXAlignment.Center,
-    })
-    lbl(f,{
-        Text=labelText,
-        TextSize=9,
-        TextColor3=C.sub,
-        Size=UDim2.new(1,0,0,14),
-        Position=UDim2.new(0,0,1,-16),
-        TextXAlignment=Enum.TextXAlignment.Center,
-    })
-    if key then miniStatLabels[key]=f:FindFirstChildOfClass("TextLabel") end
-    return f
-end
-
--- Progress bar
-local function progressBar(parent,order)
-    local wrap=frame(parent,{
-        Size=UDim2.new(1,0,0,22),
-        BackgroundColor3=C.surf,
-        BorderSizePixel=1,
-        BorderColor3=C.border,
-        LayoutOrder=order,
-    })
-    corner(wrap,4)
-    addPad(wrap,8,8,0,0)
-    local track=frame(wrap,{
-        Size=UDim2.new(1,0,0,4),
-        Position=UDim2.new(0,0,0.5,-2),
-        BackgroundColor3=C.mute,
-        BorderSizePixel=0,
-    })
-    corner(track,2)
-    local fill=frame(track,{
-        Size=UDim2.new(0,0,1,0),
-        BackgroundColor3=C.acc,
-        BorderSizePixel=0,
-    })
-    corner(fill,2)
-    local timerLbl=lbl(wrap,{
-        Text="--",
-        TextSize=9,
-        TextColor3=C.acc,
-        Size=UDim2.new(0.5,0,1,0),
-        Position=UDim2.new(0,0,0,0),
-    })
-    local pctLbl=lbl(wrap,{
-        Text="",
-        TextSize=9,
-        TextColor3=C.sub,
-        Size=UDim2.new(0.5,0,1,0),
-        Position=UDim2.new(0.5,0,0,0),
-        TextXAlignment=Enum.TextXAlignment.Right,
-    })
-    return wrap, fill, timerLbl, pctLbl
-end
-
--- Toggle button
-local function toggle(parent,label,onCol,order,onChange)
-    local state=false
-    local offcol=C.mute
-    local b=frame(parent,{
-        Size=UDim2.new(1,0,0,28),
-        BackgroundColor3=C.surf,
-        BorderSizePixel=1,
-        BorderColor3=C.border,
-        LayoutOrder=order,
-    })
-    corner(b,5)
-    -- label text
-    lbl(b,{
-        Text=label,
-        TextSize=11,
-        TextColor3=C.txt,
-        Size=UDim2.new(1,-50,1,0),
-        Position=UDim2.new(0,10,0,0),
-    })
-    -- pill
-    local pill=frame(b,{
-        Size=UDim2.new(0,36,0,16),
-        Position=UDim2.new(1,-44,0.5,-8),
-        BackgroundColor3=offcol,
-        BorderSizePixel=0,
-    })
-    corner(pill,8)
-    local knob=frame(pill,{
-        Size=UDim2.new(0,12,0,12),
-        Position=UDim2.new(0,2,0.5,-6),
-        BackgroundColor3=C.white,
-        BorderSizePixel=0,
-    })
-    corner(knob,6)
-    local pillLbl=lbl(pill,{
-        Text="off",
-        TextSize=8,
-        TextColor3=C.sub,
-        Size=UDim2.new(1,-16,1,0),
-        Position=UDim2.new(0,16,0,0),
-        TextXAlignment=Enum.TextXAlignment.Center,
-    })
-    -- clickable overlay
-    local clickBtn=Instance.new("TextButton",b)
-    clickBtn.Size=UDim2.new(1,0,1,0); clickBtn.BackgroundTransparency=1
-    clickBtn.Text=""; clickBtn.BorderSizePixel=0; clickBtn.ZIndex=2
-    clickBtn.MouseButton1Click:Connect(function()
-        state=not state
-        pill.BackgroundColor3=state and onCol or offcol
-        knob.Position=state and UDim2.new(1,-14,0.5,-6) or UDim2.new(0,2,0.5,-6)
-        pillLbl.Text=state and "on" or "off"
-        pillLbl.TextColor3=state and C.white or C.sub
-        pillLbl.Position=state and UDim2.new(0,2,0,0) or UDim2.new(0,16,0,0)
-        b.BorderColor3=state and onCol or C.border
-        onChange(state)
-    end)
-    return b, function() return state end
-end
-
--- Action button
-local function actionBtn(parent,text,col,order,onClick)
-    local b=btn(parent,{
-        Text=text,
-        TextSize=11,
-        TextColor3=C.white,
-        BackgroundColor3=col,
-        Size=UDim2.new(1,0,0,28),
-        BorderSizePixel=0,
-        LayoutOrder=order,
-    },onClick)
-    corner(b,5)
-    b.MouseEnter:Connect(function()
-        b.BackgroundColor3=Color3.fromRGB(
-            math.min(255,math.floor(col.R*255)+20),
-            math.min(255,math.floor(col.G*255)+20),
-            math.min(255,math.floor(col.B*255)+20))
-    end)
-    b.MouseLeave:Connect(function() b.BackgroundColor3=col end)
-    return b
-end
-
--- Slider row
-local sliderValues={}
-local function sliderRow(parent,labelText,key,min,max,default,order)
-    local f=frame(parent,{
-        Size=UDim2.new(1,0,0,42),
-        BackgroundColor3=C.surf,
-        BorderSizePixel=1,
-        BorderColor3=C.border,
-        LayoutOrder=order,
-    })
-    corner(f,5)
-    lbl(f,{
-        Text=labelText,
-        TextSize=10,
-        TextColor3=C.txt,
-        Size=UDim2.new(0.6,0,0,16),
-        Position=UDim2.new(0,10,0,4),
-    })
-    local valLbl=lbl(f,{
-        Text=tostring(default),
-        TextSize=10,
-        TextColor3=C.acc,
-        Size=UDim2.new(0.4,-10,0,16),
-        Position=UDim2.new(0.6,0,0,4),
-        TextXAlignment=Enum.TextXAlignment.Right,
-    })
-    local track=frame(f,{
-        Size=UDim2.new(1,-20,0,4),
-        Position=UDim2.new(0,10,0,26),
-        BackgroundColor3=C.mute,
-        BorderSizePixel=0,
-    })
-    corner(track,2)
-    local fill=frame(track,{
-        Size=UDim2.new((default-min)/(max-min),0,1,0),
-        BackgroundColor3=C.acc,
-        BorderSizePixel=0,
-    })
-    corner(fill,2)
-    local thumb=frame(track,{
-        Size=UDim2.new(0,12,0,12),
-        Position=UDim2.new((default-min)/(max-min),0,0.5,-6),
-        BackgroundColor3=C.white,
-        BorderSizePixel=0,
-        ZIndex=2,
-    })
-    corner(thumb,6)
-    -- drag
-    local sliding=false
-    local function update(x)
-        local pct=math.clamp((x-track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
-        local val=math.floor(min+(max-min)*pct*10+0.5)/10
-        fill.Size=UDim2.new(pct,0,1,0)
-        thumb.Position=UDim2.new(pct,-6,0.5,-6)
-        valLbl.Text=tostring(val)
-        sliderValues[key]=val
-        if CFG[key]~=nil then CFG[key]=val end
-    end
-    track.InputBegan:Connect(function(inp)
-        if inp.UserInputType==Enum.UserInputType.MouseButton1 then sliding=true; update(inp.Position.X) end
-    end)
-    track.InputEnded:Connect(function(inp)
-        if inp.UserInputType==Enum.UserInputType.MouseButton1 then sliding=false end
-    end)
-    UIS.InputChanged:Connect(function(inp)
-        if sliding and inp.UserInputType==Enum.UserInputType.MouseMovement then update(inp.Position.X) end
-    end)
-    sliderValues[key]=default
-    return f
-end
-
--- ── WINDOW ────────────────────────────────────────────────────
-local Main=frame(SG,{
-    Name="Main", Active=true,
-    Size=UDim2.new(0,WIN_W,0,560),
-    Position=UDim2.new(0.5,-WIN_W/2,0.5,-280),
-    BackgroundColor3=C.bg,
-    BorderSizePixel=1,
-    BorderColor3=C.border,
-    ClipsDescendants=true,
-})
-corner(Main,6)
-
--- drag
 RunService.RenderStepped:Connect(function()
     if not Dragging then return end
     local mp=UIS:GetMouseLocation(); local vp=Cam.ViewportSize
-    Main.Position=UDim2.new(0,math.clamp(mp.X-DragOff.X,0,vp.X-WIN_W),0,math.clamp(mp.Y-DragOff.Y,0,vp.Y-80))
+    Main.Position=UDim2.new(0,math.clamp(mp.X-DragOff.X,0,vp.X-WIN_W),0,math.clamp(mp.Y-DragOff.Y,0,vp.Y-60))
 end)
 
--- ── TITLE BAR ─────────────────────────────────────────────────
-local titleBar=frame(Main,{
-    Size=UDim2.new(1,0,0,32),
-    BackgroundColor3=C.surf,
-    BorderSizePixel=0,
-})
--- gold accent strip under title
-frame(titleBar,{
-    Size=UDim2.new(1,0,0,1),
-    Position=UDim2.new(0,0,1,-1),
-    BackgroundColor3=C.acc,
-    BorderSizePixel=0,
-})
-lbl(titleBar,{
-    Text="c3  automs",
-    TextSize=13,
-    TextColor3=C.acc,
-    Font=Enum.Font.Code,
-    Size=UDim2.new(1,-70,1,0),
-    Position=UDim2.new(0,12,0,0),
-})
--- status badge in title
-local titleBadge=frame(titleBar,{
-    Size=UDim2.new(0,50,0,18),
-    Position=UDim2.new(1,-108,0.5,-9),
-    BackgroundColor3=C.mute,
-    BorderSizePixel=0,
-})
-corner(titleBadge,4)
-local titleBadgeLbl=lbl(titleBadge,{
-    Text="idle",
-    TextSize=9,
-    TextColor3=C.sub,
-    Size=UDim2.new(1,0,1,0),
-    TextXAlignment=Enum.TextXAlignment.Center,
-})
--- minimize
-local minBtn=btn(titleBar,{
-    Text="─", TextSize=11, TextColor3=C.sub,
-    BackgroundColor3=C.mute,
-    Size=UDim2.new(0,22,0,22),
-    Position=UDim2.new(1,-48,0.5,-11),
-})
-corner(minBtn,4)
--- close
-local xBtn=btn(titleBar,{
-    Text="✕", TextSize=10, TextColor3=C.white,
-    BackgroundColor3=C.red,
-    Size=UDim2.new(0,22,0,22),
-    Position=UDim2.new(1,-24,0.5,-11),
-},function() stopFarm(); SG:Destroy() end)
-corner(xBtn,4)
+-- Title bar — drag handle
+local titleBar=Instance.new("Frame",Main)
+titleBar.Size=UDim2.new(1,0,0,26); titleBar.Position=UDim2.new(0,0,0,0)
+titleBar.BackgroundColor3=DKBG; titleBar.BorderSizePixel=0
+local titleLbl=Instance.new("TextLabel",titleBar)
+titleLbl.Text="c3 automs"; titleLbl.Font=Enum.Font.Code
+titleLbl.TextSize=13; titleLbl.TextColor3=RED
+titleLbl.BackgroundTransparency=1; titleLbl.Size=UDim2.new(1,-55,1,0)
+titleLbl.Position=UDim2.new(0,6,0,0); titleLbl.TextXAlignment=Enum.TextXAlignment.Left
+local minBtn=Instance.new("TextButton",titleBar)
+minBtn.Text="-"; minBtn.Font=Enum.Font.Code; minBtn.TextSize=14
+minBtn.TextColor3=MUTE; minBtn.BackgroundColor3=DKBG
+minBtn.Size=UDim2.new(0,22,1,0); minBtn.Position=UDim2.new(1,-46,0,0)
+minBtn.BorderSizePixel=0; minBtn.AutoButtonColor=false
+local xBtn=Instance.new("TextButton",titleBar)
+xBtn.Text="x"; xBtn.Font=Enum.Font.Code; xBtn.TextSize=13
+xBtn.TextColor3=RED; xBtn.BackgroundColor3=DKBG
+xBtn.Size=UDim2.new(0,22,1,0); xBtn.Position=UDim2.new(1,-22,0,0)
+xBtn.BorderSizePixel=0; xBtn.AutoButtonColor=false
+xBtn.MouseButton1Click:Connect(function() stopFarm(); SG:Destroy() end)
 
 titleBar.InputBegan:Connect(function(inp)
     if inp.UserInputType==Enum.UserInputType.MouseButton1 then
@@ -1183,639 +777,143 @@ titleBar.InputEnded:Connect(function(inp)
     if inp.UserInputType==Enum.UserInputType.MouseButton1 then Dragging=false end
 end)
 
-local minimized=false
-minBtn.MouseButton1Click:Connect(function()
-    minimized=not minimized
-    minBtn.Text=minimized and "▪" or "─"
-    Main.Size=minimized and UDim2.new(0,WIN_W,0,32) or UDim2.new(0,WIN_W,0,560)
-end)
+-- Tab strip
+local tabStrip=Instance.new("Frame",Main)
+tabStrip.Size=UDim2.new(1,0,0,20); tabStrip.Position=UDim2.new(0,0,0,26)
+tabStrip.BackgroundColor3=DKBG; tabStrip.BorderSizePixel=0
+local tsLayout=Instance.new("UIListLayout",tabStrip)
+tsLayout.FillDirection=Enum.FillDirection.Horizontal; tsLayout.SortOrder=Enum.SortOrder.LayoutOrder
 
--- ── TAB STRIP ─────────────────────────────────────────────────
-local tabBar=frame(Main,{
-    Size=UDim2.new(1,0,0,30),
-    Position=UDim2.new(0,0,0,32),
-    BackgroundColor3=C.bg,
-    BorderSizePixel=0,
-})
-addList(tabBar,0,Enum.FillDirection.Horizontal)
-
-local pages={}; local tabBtns={}; local activeTab=""
-
-local function switchTab(name)
-    activeTab=name
-    for n,tb in pairs(tabBtns) do
-        local active=n==name
-        tb.BackgroundColor3=active and C.surf or C.bg
-        tb.TextColor3=active and C.acc or C.sub
-        -- bottom indicator
-        local ind=tb:FindFirstChild("ind")
-        if ind then ind.BackgroundTransparency=active and 0 or 1 end
-    end
-    for n,p in pairs(pages) do p.Visible=n==name end
-end
-
-local tabDefs={
-    {n="farm",label="farm"},
-    {n="cfg", label="cfg"},
-    {n="hook",label="hook"},
-    {n="rec", label="rec"},
-}
-for _,td in ipairs(tabDefs) do
-    local tb=btn(tabBar,{
-        Text=td.label, TextSize=10, Font=Enum.Font.Code,
-        TextColor3=C.sub,
-        BackgroundColor3=C.bg,
-        Size=UDim2.new(1/#tabDefs,0,1,0),
-        BorderSizePixel=0,
-    })
-    -- bottom accent indicator
-    local ind=frame(tb,{Name="ind",
-        Size=UDim2.new(1,0,0,2),
-        Position=UDim2.new(0,0,1,-2),
-        BackgroundColor3=C.acc,
-        BorderSizePixel=0,
-        BackgroundTransparency=1,
-    })
-    tb.MouseButton1Click:Connect(function() switchTab(td.n) end)
-    tabBtns[td.n]=tb
-end
-
--- bottom strip border
-frame(tabBar,{
-    Size=UDim2.new(1,0,0,1),
-    Position=UDim2.new(0,0,1,-1),
-    BackgroundColor3=C.border,
-    BorderSizePixel=0,
-})
-
--- ── PAGES ─────────────────────────────────────────────────────
-local pageContainer=frame(Main,{
-    Size=UDim2.new(1,0,1,-62),
-    Position=UDim2.new(0,0,0,62),
-    BackgroundTransparency=1,
-    BorderSizePixel=0,
-    ClipsDescendants=true,
-})
-
-local function makePage(name)
-    local p=Instance.new("ScrollingFrame",pageContainer)
-    p.Name=name; p.Visible=false
-    p.Size=UDim2.new(1,0,1,0)
-    p.BackgroundTransparency=1; p.BorderSizePixel=0
-    p.ScrollBarThickness=3; p.ScrollBarImageColor3=C.border
-    p.CanvasSize=UDim2.new(0,0,0,0)
-    local l=addList(p,6)
+-- Pages
+local pages={}
+local function makePage(name,order)
+    local p=Instance.new("ScrollingFrame",Main)
+    p.Name=name; p.Size=UDim2.new(1,0,1,-46); p.Position=UDim2.new(0,0,0,46)
+    p.BackgroundTransparency=1; p.BorderSizePixel=0; p.Visible=false
+    p.ScrollBarThickness=2; p.ScrollBarImageColor3=MUTE; p.CanvasSize=UDim2.new(0,0,0,0)
+    local l=Instance.new("UIListLayout",p); l.SortOrder=Enum.SortOrder.LayoutOrder; l.Padding=UDim.new(0,2)
     l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        p.CanvasSize=UDim2.new(0,0,0,l.AbsoluteContentSize.Y+10)
+        p.CanvasSize=UDim2.new(0,0,0,l.AbsoluteContentSize.Y+8)
     end)
-    addPad(p,8,8,8,8)
+    local pad=Instance.new("UIPadding",p)
+    pad.PaddingLeft=UDim.new(0,5); pad.PaddingRight=UDim.new(0,5)
+    pad.PaddingTop=UDim.new(0,4); pad.PaddingBottom=UDim.new(0,6)
     pages[name]=p; return p
 end
 
-local FARM_PAGE   = makePage("farm")
-local CFG_PAGE    = makePage("cfg")
-local HOOK_PAGE   = makePage("hook")
-local REC_PAGE    = makePage("rec")
+local MAIN_PAGE   = makePage("Main",1)
+local CONFIG_PAGE = makePage("Config",2)
+local WEBHOOK_PAGE= makePage("Webhook",3)
+MAIN_PAGE.Visible=true
 
--- ══════════════════════════════════════════════════════════════
--- FARM PAGE
--- ══════════════════════════════════════════════════════════════
-
--- ── STATUS CARD ───────────────────────────────────────────────
-local statusCard=card(FARM_PAGE,1)
-addPad(statusCard,0,0,8,8)
-local statusCardList=addList(statusCard,2)
-
-local lStatus_main=lbl(statusCard,{
-    Text="idle",
-    TextSize=12,
-    TextColor3=C.acc,
-    Font=Enum.Font.Code,
-    Size=UDim2.new(1,-16,0,20),
-    Position=UDim2.new(0,8,0,8),
-    LayoutOrder=1,
-})
-
--- step timer bar inside status card
-local stepWrap=frame(statusCard,{
-    Size=UDim2.new(1,-16,0,16),
-    BackgroundTransparency=1,
-    LayoutOrder=2,
-})
-local stepBar=frame(stepWrap,{
-    Size=UDim2.new(1,0,0,4),
-    Position=UDim2.new(0,0,0,0),
-    BackgroundColor3=C.mute,
-    BorderSizePixel=0,
-})
-corner(stepBar,2)
-local stepFill=frame(stepBar,{
-    Size=UDim2.new(0,0,1,0),
-    BackgroundColor3=C.acc,
-    BorderSizePixel=0,
-})
-corner(stepFill,2)
-local stepLbl=lbl(stepWrap,{
-    Text="step: --",
-    TextSize=9,
-    TextColor3=C.sub,
-    Size=UDim2.new(0.5,0,0,12),
-    Position=UDim2.new(0,0,0,6),
-})
-local stepPct=lbl(stepWrap,{
-    Text="",
-    TextSize=9,
-    TextColor3=C.acc,
-    Size=UDim2.new(0.5,0,0,12),
-    Position=UDim2.new(0.5,0,0,6),
-    TextXAlignment=Enum.TextXAlignment.Right,
-})
-
--- ── MINI STAT GRID ────────────────────────────────────────────
-local miniGrid=frame(FARM_PAGE,{
-    Size=UDim2.new(1,0,0,96),
-    BackgroundTransparency=1,
-    LayoutOrder=2,
-})
-local miniGridLayout=Instance.new("UIGridLayout",miniGrid)
-miniGridLayout.CellSize=UDim2.new(0.5,-3,0,44)
-miniGridLayout.CellPadding=UDim2.new(0,4,0,4)
-miniGridLayout.SortOrder=Enum.SortOrder.LayoutOrder
-
-miniStat(miniGrid,"batches","batches","0",C.acc)
-miniStat(miniGrid,"earned","earned","$0",C.green)
-miniStat(miniGrid,"inbag","in bag","0",C.yellow)
-miniStat(miniGrid,"failed","failed","0",C.red)
-
--- ── COOK TIMERS ───────────────────────────────────────────────
-sectionHeader(FARM_PAGE,"cook",3)
-local timerCard=card(FARM_PAGE,4)
-addPad(timerCard,0,0,4,4)
-addList(timerCard,0)
-local lCookTime = statRow(timerCard,"cooktime","cook time","--",C.yellow,1)
-local lAvgCook  = statRow(timerCard,"avgcook","avg cook","--",C.sub,2)
-local lUptime   = statRow(timerCard,"uptime","uptime","0:00",C.sub,3)
-local lSmall    = statRow(timerCard,"small","small",  "0",C.green,4)
-local lMedium   = statRow(timerCard,"medium","medium", "0",C.green,5)
-local lLarge    = statRow(timerCard,"large","large",   "0",C.green,6)
-
--- ── INVENTORY ─────────────────────────────────────────────────
-sectionHeader(FARM_PAGE,"inventory",5)
-local invCard=card(FARM_PAGE,6)
-addPad(invCard,8,8,8,8)
-local invGrid=frame(invCard,{
-    Size=UDim2.new(1,0,0,40),
-    BackgroundTransparency=1,
-})
-local invGridLayout=Instance.new("UIGridLayout",invGrid)
-invGridLayout.CellSize=UDim2.new(0.333,-4,0,40)
-invGridLayout.CellPadding=UDim2.new(0,4,0,0)
-invGridLayout.SortOrder=Enum.SortOrder.LayoutOrder
-
-local function invPill(parent,key,label,order)
-    local f=frame(parent,{BackgroundColor3=C.surf,BorderSizePixel=1,BorderColor3=C.border,LayoutOrder=order})
-    corner(f,5)
-    lbl(f,{
-        Text=label,
-        TextSize=8,TextColor3=C.sub,
-        Size=UDim2.new(1,0,0,12),Position=UDim2.new(0,0,0,3),
-        TextXAlignment=Enum.TextXAlignment.Center,
-    })
-    local lcount=lbl(f,{
-        Text="0",
-        TextSize=12,TextColor3=C.red,Font=Enum.Font.Code,
-        Size=UDim2.new(1,0,0,16),Position=UDim2.new(0,0,0,15),
-        TextXAlignment=Enum.TextXAlignment.Center,
-    })
-    miniStatLabels["inv_"..key]=lcount
-    return f
+local tabBtns={}; local activeTabName="Main"
+local function switchTab(name)
+    activeTabName=name
+    for n,b in pairs(tabBtns) do
+        b.BackgroundColor3=n==name and Color3.fromRGB(36,36,40) or DKBG
+        b.TextColor3=n==name and WHITE or MUTE
+    end
+    for n,p in pairs(pages) do p.Visible=n==name end
 end
-invPill(invGrid,"w","water",1)
-invPill(invGrid,"s","sugar",2)
-invPill(invGrid,"g","gelatin",3)
+local minimized=false
+minBtn.MouseButton1Click:Connect(function()
+    minimized=not minimized
+    minBtn.Text=minimized and "+" or "-"
+    for _,p in pairs(pages) do p.Visible=not minimized and (p.Name==activeTabName) end
+    tabStrip.Visible=not minimized
+    Main.Size=minimized and UDim2.new(0,WIN_W,0,26) or UDim2.new(0,WIN_W,0,520)
+end)
 
--- ── LOG ───────────────────────────────────────────────────────
-sectionHeader(FARM_PAGE,"log",7)
-local logCard=card(FARM_PAGE,8)
-addPad(logCard,0,0,4,4)
-addList(logCard,1)
-local logLabels={}
-for i=1,4 do
-    local l=lbl(logCard,{
-        Text="",
-        TextSize=9,
-        TextColor3= i==1 and C.acc or C.sub,
-        Size=UDim2.new(1,0,0,13),
-        LayoutOrder=i,
-    })
-    addPad(l,8,8,0,0)
-    logLabels[i]=l
+local tabNames={"Main","Config","Webhook","Recorder"}
+for _,name in ipairs(tabNames) do
+    local b=Instance.new("TextButton",tabStrip)
+    b.Text=name; b.Font=Enum.Font.Code; b.TextSize=10
+    b.TextColor3=MUTE; b.BackgroundColor3=DKBG
+    b.Size=UDim2.new(1/#tabNames,0,1,0); b.BorderSizePixel=0; b.AutoButtonColor=false
+    b.MouseButton1Click:Connect(function() switchTab(name) end)
+    tabBtns[name]=b
+end
+tabBtns["Main"].BackgroundColor3=Color3.fromRGB(36,36,40); tabBtns["Main"].TextColor3=WHITE
+
+-- ── UI HELPERS ────────────────────────────────────────────────
+local function mkLbl(parent,text,col,order)
+    local l=Instance.new("TextLabel",parent)
+    l.Text=text; l.Font=Enum.Font.Code; l.TextSize=11
+    l.TextColor3=col or WHITE; l.BackgroundTransparency=1
+    l.Size=UDim2.new(1,0,0,13); l.TextXAlignment=Enum.TextXAlignment.Left
+    l.LayoutOrder=order or 99; return l
 end
 
-local logHistory={}
-local function pushLog(msg)
-    table.insert(logHistory,1,msg)
-    if #logHistory>4 then table.remove(logHistory) end
-    for i,l in ipairs(logLabels) do
-        l.Text=logHistory[i] or ""
-        l.TextColor3=i==1 and C.acc or C.sub
-    end
+local function mkBtn(parent,text,col,order,onClick)
+    local b=Instance.new("TextButton",parent)
+    b.Text=text; b.Font=Enum.Font.GothamBold; b.TextSize=11
+    b.TextColor3=WHITE; b.BackgroundColor3=col or DKGREY
+    b.Size=UDim2.new(1,0,0,24); b.BorderSizePixel=0
+    b.AutoButtonColor=true; b.LayoutOrder=order or 99
+    b.MouseButton1Click:Connect(onClick or function() end)
+    return b
 end
 
--- ── TOGGLES ───────────────────────────────────────────────────
-sectionHeader(FARM_PAGE,"options",9)
-
-local antiAFKToggle,_=toggle(FARM_PAGE,"anti afk",C.green,10,function(v)
-    antiAFK=v
-    if v then
-        if afkThread then task.cancel(afkThread) end
-        afkThread=task.spawn(function()
-            while antiAFK do
-                task.wait(60)
-                if not antiAFK then break end
-                VIM:SendKeyEvent(true,Enum.KeyCode.Space,false,game); task.wait(0.1)
-                VIM:SendKeyEvent(false,Enum.KeyCode.Space,false,game)
-            end
-        end)
-    else if afkThread then task.cancel(afkThread); afkThread=nil end end
-end)
-
-local ctrlDeleteToggle,_=toggle(FARM_PAGE,"ctrl+delete to close",C.green,11,function(v) ctrlDelete=v end)
-local antiDeathToggle,_=toggle(FARM_PAGE,"anti death",C.green,12,function(v)
-    antiDeath=v
-    if v and LP.Character then
-        local hum=LP.Character:FindFirstChildOfClass("Humanoid")
-        if hum then pcall(function() hum.MaxHealth=math.huge; hum.Health=math.huge end) end
-    end
-end)
-local jitterToggle,_=toggle(FARM_PAGE,"jitter (anti-detect)",C.green,13,function(v) CFG.jitter=v end)
-
--- ── ACTIONS ───────────────────────────────────────────────────
-sectionHeader(FARM_PAGE,"actions",14)
-
-actionBtn(FARM_PAGE,"sell all now",C.blue,15,function()
-    if not selling then task.spawn(doSell) end
-end)
-actionBtn(FARM_PAGE,"buy water",Color3.fromRGB(30,80,170),16,function()
-    task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Water") end)
-end)
-actionBtn(FARM_PAGE,"buy sugar block bag",Color3.fromRGB(120,65,0),17,function()
-    task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Sugar Block Bag") end)
-end)
-actionBtn(FARM_PAGE,"buy gelatin",Color3.fromRGB(80,0,140),18,function()
-    task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Gelatin") end)
-end)
-actionBtn(FARM_PAGE,"tp → seller",Color3.fromRGB(20,80,40),19,function() directTP(SELLER_POS) end)
-actionBtn(FARM_PAGE,"tp → apartment",Color3.fromRGB(0,70,80),20,function() directTP(Vector3.new(1009,10,216)) end)
-actionBtn(FARM_PAGE,"save cook spot",C.mute,21,function()
-    local c=LP.Character; local r=c and c:FindFirstChild("HumanoidRootPart")
-    if r then savedCookPos=r.Position
-        pushLog("saved cook spot "..math.floor(r.Position.X)..","..math.floor(r.Position.Y)..","..math.floor(r.Position.Z))
-    end
-end)
-actionBtn(FARM_PAGE,"return to cook spot",C.mute,22,function()
-    if savedCookPos then directTP(savedCookPos) end
-end)
-actionBtn(FARM_PAGE,"reset stats",C.mute,23,function()
-    stats.batches=0; stats.small=0; stats.medium=0; stats.large=0
-    stats.earned=0; stats.spent=0; stats.failed=0
-    stats.farmUptime=0; stats.farmStarted=farmEnabled and tick() or nil
-    pushLog("stats reset")
-end)
-
--- ── BOTTOM BUTTONS ────────────────────────────────────────────
-local bottomBar=frame(FARM_PAGE,{
-    Size=UDim2.new(1,0,0,64),
-    BackgroundTransparency=1,
-    LayoutOrder=99,
-})
-local bbList=addList(bottomBar,4)
-
-local startStopBtn=btn(bottomBar,{
-    Text="start farm",
-    TextSize=12, Font=Enum.Font.Code,
-    TextColor3=C.white,
-    BackgroundColor3=C.green,
-    Size=UDim2.new(1,0,0,30),
-    BorderSizePixel=0,
-    LayoutOrder=1,
-},nil)
-corner(startStopBtn,5)
-
-local loopBtn=btn(bottomBar,{
-    Text="start loop",
-    TextSize=11, Font=Enum.Font.Code,
-    TextColor3=C.white,
-    BackgroundColor3=Color3.fromRGB(30,60,130),
-    Size=UDim2.new(1,0,0,26),
-    BorderSizePixel=0,
-    LayoutOrder=2,
-},nil)
-corner(loopBtn,5)
-
-startStopBtn.MouseButton1Click:Connect(function()
-    if farmEnabled and not loopEnabled then
-        stopFarm()
-        startStopBtn.Text="start farm"; startStopBtn.BackgroundColor3=C.green
-        titleBadgeLbl.Text="idle"; titleBadge.BackgroundColor3=C.mute
-    else
-        startFarm()
-        startStopBtn.Text="stop farm"; startStopBtn.BackgroundColor3=C.red
-        loopBtn.Text="start loop"; loopBtn.BackgroundColor3=Color3.fromRGB(30,60,130)
-        titleBadgeLbl.Text="farming"; titleBadge.BackgroundColor3=Color3.fromRGB(20,80,30)
-        titleBadgeLbl.TextColor3=C.green
-    end
-end)
-
-loopBtn.MouseButton1Click:Connect(function()
-    if loopEnabled then
-        stopFarm()
-        loopBtn.Text="start loop"; loopBtn.BackgroundColor3=Color3.fromRGB(30,60,130)
-        startStopBtn.Text="start farm"; startStopBtn.BackgroundColor3=C.green
-        titleBadgeLbl.Text="idle"; titleBadge.BackgroundColor3=C.mute
-    else
-        startLoop()
-        loopBtn.Text="stop loop"; loopBtn.BackgroundColor3=C.red
-        startStopBtn.Text="start farm"; startStopBtn.BackgroundColor3=C.green
-        titleBadgeLbl.Text="looping"; titleBadge.BackgroundColor3=Color3.fromRGB(20,40,100)
-        titleBadgeLbl.TextColor3=C.blue
-    end
-end)
-
--- ══════════════════════════════════════════════════════════════
--- CONFIG PAGE
--- ══════════════════════════════════════════════════════════════
-sectionHeader(CFG_PAGE,"cook timings",1)
-sliderRow(CFG_PAGE,"water wait (s)","waterWait",5,40,22,2)
-sliderRow(CFG_PAGE,"sugar wait (s)","sugarWait",0.5,10,2.5,3)
-sliderRow(CFG_PAGE,"gelatin wait (s)","gelatinWait",20,60,47,4)
-sliderRow(CFG_PAGE,"watchdog (s)","watchdogSec",30,300,90,5)
-
-sectionHeader(CFG_PAGE,"prices",6)
-local function priceRow(parent,label,key,order)
-    local f=frame(parent,{
-        Size=UDim2.new(1,0,0,30),
-        BackgroundColor3=C.surf,
-        BorderSizePixel=1, BorderColor3=C.border,
-        LayoutOrder=order,
-    })
-    corner(f,5)
-    lbl(f,{
-        Text=label, TextSize=10, TextColor3=C.txt,
-        Size=UDim2.new(0.55,0,1,0), Position=UDim2.new(0,10,0,0),
-    })
-    local vl=lbl(f,{
-        Text="$"..PRICES[key], TextSize=10, TextColor3=C.acc,
-        Size=UDim2.new(0.25,0,1,0), Position=UDim2.new(0.55,0,0,0),
-        TextXAlignment=Enum.TextXAlignment.Center,
-    })
-    local mb=btn(f,{Text="-",TextSize=12,TextColor3=C.white,BackgroundColor3=C.mute,
-        Size=UDim2.new(0,22,0,22),Position=UDim2.new(1,-48,0.5,-11)},nil)
-    corner(mb,4)
-    local ab=btn(f,{Text="+",TextSize=12,TextColor3=C.white,BackgroundColor3=C.mute,
-        Size=UDim2.new(0,22,0,22),Position=UDim2.new(1,-24,0.5,-11)},nil)
-    corner(ab,4)
-    mb.MouseButton1Click:Connect(function() PRICES[key]=math.max(0,PRICES[key]-10); vl.Text="$"..PRICES[key] end)
-    ab.MouseButton1Click:Connect(function() PRICES[key]=PRICES[key]+10; vl.Text="$"..PRICES[key] end)
-end
-priceRow(CFG_PAGE,"small bag","Small",7)
-priceRow(CFG_PAGE,"medium bag","Medium",8)
-priceRow(CFG_PAGE,"large bag","Large",9)
-
-sectionHeader(CFG_PAGE,"options",10)
-toggle(CFG_PAGE,"jitter (random delays)",C.green,11,function(v) CFG.jitter=v end)
-toggle(CFG_PAGE,"micro movements",C.green,12,function(v) CFG.microMove=v end)
-toggle(CFG_PAGE,"auto underground",C.green,13,function(v) CFG.autoUG=v end)
-
--- ══════════════════════════════════════════════════════════════
--- WEBHOOK PAGE
--- ══════════════════════════════════════════════════════════════
-sectionHeader(HOOK_PAGE,"discord webhook",1)
-local whCard=card(HOOK_PAGE,2)
-addPad(whCard,8,8,8,8)
-local whBox=Instance.new("TextBox",whCard)
-whBox.Size=UDim2.new(1,0,0,28); whBox.Font=Enum.Font.Code; whBox.TextSize=9
-whBox.Text=""; whBox.PlaceholderText="https://discord.com/api/webhooks/..."
-whBox.TextColor3=C.txt; whBox.PlaceholderColor3=C.sub
-whBox.BackgroundColor3=C.bg; whBox.BorderSizePixel=1
-whBox.ClearTextOnFocus=false; whBox.TextXAlignment=Enum.TextXAlignment.Left
-corner(whBox,4)
-addPad(whBox,6,6,0,0)
-whBox:GetPropertyChangedSignal("Text"):Connect(function() WEBHOOK_URL=whBox.Text end)
-
-sectionHeader(HOOK_PAGE,"settings",3)
-sliderRow(HOOK_PAGE,"every N batches","webhookBatches",1,50,5,4)
-actionBtn(HOOK_PAGE,"test webhook",C.blue,5,function()
-    if WEBHOOK_URL=="" then pushLog("⚠ no webhook url set"); return end
-    sendWebhook("✅ test from c3 automs — working!")
-end)
-actionBtn(HOOK_PAGE,"send stats now",C.mute,6,function() sendWebhook("📊 manual stats report") end)
-
--- ══════════════════════════════════════════════════════════════
--- RECORDER PAGE
--- ══════════════════════════════════════════════════════════════
-local RECORDER_PAGE = REC_PAGE
-sectionHeader(REC_PAGE,"recorder",1)
-
-local WATCH_KEYS = {
-    Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
-    Enum.KeyCode.Space, Enum.KeyCode.LeftShift, Enum.KeyCode.E, Enum.KeyCode.F,
-    Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four,
-}
-
-local Rec = {
-    Recording=false, Playing=false, Frames={}, Conn=nil,
-    PlayIdx=0, Repeating=false, RepeatCount=1, CurrentRep=0, PrevHeld={},
-}
-
-local function fireKey(down,kc)
-    pcall(function() VIM:SendKeyEvent(down,kc,false,game) end)
-end
-local function releaseAllKeys()
-    for _,kc in ipairs(WATCH_KEYS) do fireKey(false,kc) end
-    pcall(function()
-        local mp=UIS:GetMouseLocation()
-        VIM:SendMouseButtonEvent(mp.X,mp.Y,0,false,game,0)
+local function mkToggle(parent,label,onCol,order,onChange)
+    local state=false
+    local b=mkBtn(parent,label..": OFF",DKGREY,order)
+    b.MouseButton1Click:Connect(function()
+        state=not state
+        b.Text=label..(state and ": ON" or ": OFF")
+        b.BackgroundColor3=state and onCol or DKGREY
+        onChange(state)
     end)
+    return b
 end
 
-local recCard=card(REC_PAGE,2)
-addPad(recCard,8,8,8,8)
-addList(recCard,4)
-
-local recStatusLbl=lbl(recCard,{
-    Text="frames: 0  |  status: ready",
-    TextSize=10, TextColor3=C.sub,
-    Size=UDim2.new(1,0,0,14),
-    LayoutOrder=1,
-})
-
-local recBtnRow=frame(recCard,{
-    Size=UDim2.new(1,0,0,28), BackgroundTransparency=1, LayoutOrder=2,
-})
-local recBtnList=addList(recBtnRow,4,Enum.FillDirection.Horizontal)
-
-local function recBtn(parent,text,col,onClick)
-    local b=btn(parent,{
-        Text=text, TextSize=10, Font=Enum.Font.Code,
-        TextColor3=C.white, BackgroundColor3=col,
-        Size=UDim2.new(0.25,-3,1,0),
-        BorderSizePixel=0,
-    },onClick)
-    corner(b,4); return b
+local function mkDiv(parent,order)
+    local f=Instance.new("Frame",parent)
+    f.Size=UDim2.new(1,0,0,4); f.BackgroundTransparency=1; f.LayoutOrder=order
 end
 
-local recBtn_rec=recBtn(recBtnRow,"⏺ rec",C.red,nil)
-local recBtn_play=recBtn(recBtnRow,"▶ play",C.green,nil)
-local recBtn_rep=recBtn(recBtnRow,"🔁 loop",Color3.fromRGB(30,60,130),nil)
-local recBtn_clear=recBtn(recBtnRow,"✕ clr",C.mute,nil)
+-- ── MAIN PAGE ─────────────────────────────────────────────────
+local statsBlock=Instance.new("Frame",MAIN_PAGE)
+statsBlock.Size=UDim2.new(1,0,0,0); statsBlock.AutomaticSize=Enum.AutomaticSize.Y
+statsBlock.BackgroundTransparency=1; statsBlock.BorderSizePixel=0; statsBlock.LayoutOrder=1
+local sbl=Instance.new("UIListLayout",statsBlock); sbl.Padding=UDim.new(0,0); sbl.SortOrder=Enum.SortOrder.LayoutOrder
 
-recBtn_clear.MouseButton1Click:Connect(function()
-    Rec.Frames={}; Rec.PlayIdx=0
-    recStatusLbl.Text="frames: 0  |  status: cleared"
-end)
-
-recBtn_rec.MouseButton1Click:Connect(function()
-    if Rec.Recording then
-        Rec.Recording=false; if Rec.Conn then Rec.Conn:Disconnect(); Rec.Conn=nil end
-        recBtn_rec.Text="⏺ rec"; recBtn_rec.BackgroundColor3=C.red
-        recStatusLbl.Text="frames: "..#Rec.Frames.."  |  status: done"
-    else
-        Rec.Frames={}; Rec.Recording=true
-        recBtn_rec.Text="⏹ stop"; recBtn_rec.BackgroundColor3=C.orange
-        recStatusLbl.Text="frames: 0  |  status: recording..."
-        Rec.Conn=RunService.RenderStepped:Connect(function()
-            if not Rec.Recording then return end
-            local held={}
-            for _,kc in ipairs(WATCH_KEYS) do
-                held[tostring(kc)]=UIS:IsKeyDown(kc)
-            end
-            local mp=UIS:GetMouseLocation()
-            table.insert(Rec.Frames,{held=held,mx=mp.X,my=mp.Y,mb1=UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)})
-            recStatusLbl.Text="frames: "..#Rec.Frames.."  |  status: recording..."
-        end)
-    end
-end)
-
-recBtn_play.MouseButton1Click:Connect(function()
-    if #Rec.Frames==0 then return end
-    task.spawn(function()
-        for _,frame in ipairs(Rec.Frames) do
-            for kc_str,down in pairs(frame.held) do
-                local ok,kc=pcall(function() return Enum.KeyCode[kc_str:gsub("Enum.KeyCode.","")] end)
-                if ok and kc then fireKey(down,kc) end
-            end
-            if frame.mb1 then VIM:SendMouseButtonEvent(frame.mx,frame.my,0,true,game,0) end
-            task.wait(1/60)
-        end
-        releaseAllKeys()
-        recStatusLbl.Text="frames: "..#Rec.Frames.."  |  status: done"
-    end)
-end)
-
-recBtn_rep.MouseButton1Click:Connect(function()
-    if Rec.Repeating then
-        Rec.Repeating=false
-        recBtn_rep.BackgroundColor3=Color3.fromRGB(30,60,130)
-        recBtn_rep.Text="🔁 loop"
-    else
-        if #Rec.Frames==0 then return end
-        Rec.Repeating=true
-        recBtn_rep.BackgroundColor3=C.red
-        recBtn_rep.Text="⏹ stop"
-        task.spawn(function()
-            while Rec.Repeating do
-                for _,fr in ipairs(Rec.Frames) do
-                    if not Rec.Repeating then break end
-                    for kc_str,down in pairs(fr.held) do
-                        local ok,kc=pcall(function() return Enum.KeyCode[kc_str:gsub("Enum.KeyCode.","")] end)
-                        if ok and kc then fireKey(down,kc) end
-                    end
-                    task.wait(1/60)
-                end
-                releaseAllKeys(); task.wait(0.2)
-            end
-        end)
-    end
-end)
-
--- ══════════════════════════════════════════════════════════════
--- FLOATING BUTTON
--- ══════════════════════════════════════════════════════════════
-local floatBtn=frame(SG,{
-    Name="FloatBtn",
-    Size=UDim2.new(0,34,0,34),
-    Position=UDim2.new(1,-50,0.5,-17),
-    BackgroundColor3=C.bg,
-    BorderSizePixel=1,
-    BorderColor3=C.acc,
-})
-corner(floatBtn,6)
-lbl(floatBtn,{
-    Text="c3",
-    TextSize=11, TextColor3=C.acc,
-    Size=UDim2.new(1,0,1,0),
-    TextXAlignment=Enum.TextXAlignment.Center,
-})
-local floatDragging=false; local floatOff=Vector2.new()
-floatBtn.InputBegan:Connect(function(inp)
-    if inp.UserInputType==Enum.UserInputType.MouseButton1 then
-        -- try click vs drag
-        local startPos=inp.Position
-        task.spawn(function()
-            task.wait(0.12)
-            local mp=UIS:GetMouseLocation()
-            if (Vector2.new(startPos.X,startPos.Y)-mp).Magnitude<5 then
-                Main.Visible=not Main.Visible
-            end
-        end)
-        floatDragging=true
-        floatOff=Vector2.new(inp.Position.X-floatBtn.AbsolutePosition.X,inp.Position.Y-floatBtn.AbsolutePosition.Y)
-    end
-end)
-floatBtn.InputEnded:Connect(function(inp)
-    if inp.UserInputType==Enum.UserInputType.MouseButton1 then floatDragging=false end
-end)
-RunService.RenderStepped:Connect(function()
-    if floatDragging then
-        local mp=UIS:GetMouseLocation(); local vp=Cam.ViewportSize
-        floatBtn.Position=UDim2.new(0,math.clamp(mp.X-floatOff.X,0,vp.X-34),0,math.clamp(mp.Y-floatOff.Y,0,vp.Y-34))
-    end
-end)
-
--- ── INV REFRESH ───────────────────────────────────────────────
-lStatus = lStatus_main
+lStatus   = mkLbl(statsBlock,"status: idle",              CYAN,   1)
+local lTimer    = mkLbl(statsBlock,"step:   --",                YELLOW, 2)
+local lCookTime = mkLbl(statsBlock,"cook:   --",                WARN,   3)
+local lAvgCook  = mkLbl(statsBlock,"avg:    --",                MUTE,   4)
+local lSession  = mkLbl(statsBlock,"uptime: 0:00",              MUTE,   5)
+local lBatches  = mkLbl(statsBlock,"done:   0",                 WHITE,  6)
+local lSmall    = mkLbl(statsBlock,"small:  0",                 LGREEN, 7)
+local lMedium   = mkLbl(statsBlock,"medium: 0",                 LGREEN, 8)
+local lLarge    = mkLbl(statsBlock,"large:  0",                 LGREEN, 9)
+local lInBag    = mkLbl(statsBlock,"in bag: 0",                 YELLOW, 10)
+local lLastBag  = mkLbl(statsBlock,"last:   --",                YELLOW, 11)
+local lLog      = mkLbl(statsBlock,"log:    --",                MUTE,   12)
+local lWater    = mkLbl(statsBlock,"inv:    W:0  S:0  G:0",       LBLUE,  13)
+local lSugar    = lWater
+local lGelatin  = lWater
 
 local function refreshInv()
-    local w=countInv("Water"); local s=countInv("Sugar Block Bag"); local g=countInv("Gelatin")
-    if miniStatLabels["inv_w"] then
-        miniStatLabels["inv_w"].Text=tostring(w)
-        miniStatLabels["inv_w"].TextColor3=w>0 and C.green or C.red
-    end
-    if miniStatLabels["inv_s"] then
-        miniStatLabels["inv_s"].Text=tostring(s)
-        miniStatLabels["inv_s"].TextColor3=s>0 and C.green or C.red
-    end
-    if miniStatLabels["inv_g"] then
-        miniStatLabels["inv_g"].Text=tostring(g)
-        miniStatLabels["inv_g"].TextColor3=g>0 and C.green or C.red
-    end
+    lWater.Text="inv:    W:"..countInv("Water").."  S:"..countInv("Sugar Block Bag").."  G:"..countInv("Gelatin")
 end
 
 LP.Backpack.ChildAdded:Connect(function() task.wait(0.5); refreshInv() end)
 LP.Backpack.ChildRemoved:Connect(function() task.wait(0.8); refreshInv() end)
-task.spawn(function()
-    task.wait(0.5); refreshInv()
-    -- startup scan — count existing bags into small/medium/large/batches
+task.spawn(function() task.wait(0.5); refreshInv()
+    -- Scan existing marshmallows in backpack on execute
     local function scan(c) if not c then return end
         for _,v in ipairs(c:GetChildren()) do
             if v:IsA("Tool") then
                 local n=v.Name:lower()
                 if n:find("marshmallow") or n:find("marsh") then
-                    local size=getSizeFromName(v.Name)
+                    local size="Small"
+                    if n:find("large") then size="Large"
+                    elseif n:find("medium") then size="Medium" end
                     if size=="Large" then stats.large+=1
                     elseif size=="Medium" then stats.medium+=1
                     else stats.small+=1 end
+                    stats.batches+=1
+                    logBatch(size)
                 end
             end
         end
@@ -1824,83 +922,428 @@ task.spawn(function()
     if LP.Character then scan(LP.Character) end
 end)
 
+mkDiv(MAIN_PAGE,2)
 
--- ── BETTER STAT UPDATE — direct refs ──────────────────────────
--- Re-do statRow to return val label directly
-local function setStatLabel(key,val)
-    if statLabels[key] then statLabels[key].Text=tostring(val) end
+-- Buy buttons — match screenshot colors exactly
+mkBtn(MAIN_PAGE,"Buy Water",           BLUE,   3, function() task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Water") end) end)
+mkBtn(MAIN_PAGE,"Buy Sugar Block Bag", ORANGE, 4, function() task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Sugar Block Bag") end) end)
+mkBtn(MAIN_PAGE,"Buy Gelatin",         PURPLE, 5, function() task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Gelatin") end) end)
+
+mkDiv(MAIN_PAGE,6)
+
+-- Toggle/action buttons — match screenshot
+mkToggle(MAIN_PAGE,"Ctrl Delete",  GREEN,  7,  function(v) ctrlDelete=v end)
+mkBtn   (MAIN_PAGE,"Teleport to Seller",   GREEN,  8,  function() directTP(SELLER_POS) end)
+mkBtn   (MAIN_PAGE,"Teleport to Apartment",TEAL,   9,  function() directTP(Vector3.new(1009,10,216)) end)
+local autoSellThread = nil
+mkToggle(MAIN_PAGE,"Auto Sell",    RED,    10, function(v)
+    autoSell=v
+    if v then
+        autoSellThread=task.spawn(function()
+            while autoSell do
+                local ms=getMarshmallows()
+                if #ms>0 then
+                    local item=ms[1]
+                    local hum=LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+                    if hum and item.Parent~=LP.Character then
+                        pcall(function() hum:EquipTool(item) end)
+                        task.wait(0.1)
+                    end
+                    pressE()
+                    task.wait(0.3)
+                else
+                    task.wait(1)
+                end
+            end
+        end)
+    else
+        if autoSellThread then task.cancel(autoSellThread); autoSellThread=nil end
+    end
+end)
+mkBtn   (MAIN_PAGE,"Sell Now",     ORANGE, 11, function() task.spawn(doSell) end)
+mkBtn   (MAIN_PAGE,"🔍 Print Bag Names", Color3.fromRGB(60,60,90), 11.5, function()
+    print("=== TOOLS IN BACKPACK ===")
+    for _,v in ipairs(LP.Backpack:GetChildren()) do
+        if v:IsA("Tool") then print("  '"..v.Name.."'") end
+    end
+    if LP.Character then
+        print("=== TOOLS ON CHARACTER ===")
+        for _,v in ipairs(LP.Character:GetChildren()) do
+            if v:IsA("Tool") then print("  '"..v.Name.."'") end
+        end
+    end
+    print("========================")
+end)
+mkToggle(MAIN_PAGE,"Anti Death",   GREEN,  12, function(v)
+    antiDeath=v
+    if v then
+        local hum=LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then pcall(function() hum.MaxHealth=math.huge; hum.Health=math.huge end) end
+    end
+end)
+mkToggle(MAIN_PAGE,"Anti AFK",     GREEN,  13, function(v)
+    antiAFK=v
+    if v then
+        if afkThread then task.cancel(afkThread) end
+        afkThread=task.spawn(function()
+            while antiAFK do
+                task.wait(60)
+                if not antiAFK then break end
+                VIM:SendKeyEvent(true,Enum.KeyCode.Space,false,game)
+                task.wait(0.1)
+                VIM:SendKeyEvent(false,Enum.KeyCode.Space,false,game)
+            end
+        end)
+    else if afkThread then task.cancel(afkThread); afkThread=nil end end
+end)
+mkBtn(MAIN_PAGE,"Go Underground ⬇",Color3.fromRGB(55,55,65),14,function() if not isUG then goUnderground() end end)
+mkBtn(MAIN_PAGE,"Go Aboveground ⬆",Color3.fromRGB(55,55,65),15,function()
+    if isUG then goAboveground() else
+        local c=LP.Character; if c then local r=c:FindFirstChild("HumanoidRootPart"); if r then r.CFrame=CFrame.new(r.Position+Vector3.new(0,16,0)) end end
+    end
+end)
+mkBtn(MAIN_PAGE,"📍 Save Cook Spot",Color3.fromRGB(55,55,65),16,function()
+    local c=LP.Character; local r=c and c:FindFirstChild("HumanoidRootPart")
+    if r then savedCookPos=r.Position; setStatus("Cook spot saved!") end
+end)
+mkBtn(MAIN_PAGE,"↩ Return to Cook Spot",Color3.fromRGB(55,55,65),17,function()
+    if savedCookPos then directTP(savedCookPos)
+    else setStatus("No cook spot saved yet") end
+end)
+
+mkDiv(MAIN_PAGE,18)
+
+-- Reset stats button
+mkBtn(MAIN_PAGE,"🔄 Reset Stats", Color3.fromRGB(55,55,70), 19, function()
+    stats.batches=0; stats.small=0; stats.medium=0; stats.large=0
+    stats.failed=0; stats.batchLog={}; stats.lastBatch=""
+    stats.totalCookSecs=0; stats.cookCount=0
+    stats.sessionStart=tick()
+    stats.farmUptime=0; stats.farmStarted=farmEnabled and tick() or nil
+    setStatus("Stats reset")
+end)
+
+-- Loop button
+local loopBtn=mkBtn(MAIN_PAGE,"Loop (Cook+Sell+Buy)", BLUE, 20)
+loopBtn.MouseButton1Click:Connect(function()
+    if farmEnabled and loopEnabled then
+        stopFarm(); loopBtn.Text="Loop (Cook+Sell+Buy)"; loopBtn.BackgroundColor3=BLUE
+    else
+        startLoop(); loopBtn.Text="Stop Loop"; loopBtn.BackgroundColor3=RED
+    end
+end)
+
+mkDiv(MAIN_PAGE,21)
+
+-- Big Start/Stop button at bottom
+local startStopBtn=Instance.new("TextButton",MAIN_PAGE)
+startStopBtn.Text="Start AutoMS"; startStopBtn.Font=Enum.Font.GothamBold; startStopBtn.TextSize=14
+startStopBtn.TextColor3=WHITE; startStopBtn.BackgroundColor3=GREEN
+startStopBtn.Size=UDim2.new(1,0,0,34); startStopBtn.BorderSizePixel=0; startStopBtn.AutoButtonColor=false; startStopBtn.LayoutOrder=22
+Instance.new("UICorner",startStopBtn).CornerRadius=UDim.new(0,8)
+startStopBtn.MouseButton1Click:Connect(function()
+    if farmEnabled and not loopEnabled then
+        stopFarm(); startStopBtn.Text="Start AutoMS"; startStopBtn.BackgroundColor3=GREEN
+    else
+        startFarm(); startStopBtn.Text="Stop AutoMS"; startStopBtn.BackgroundColor3=RED
+        loopBtn.Text="Loop (Cook+Sell+Buy)"; loopBtn.BackgroundColor3=BLUE
+    end
+end)
+startStopBtn.MouseEnter:Connect(function()
+    local c=farmEnabled and Color3.fromRGB(220,0,0) or Color3.fromRGB(0,200,0)
+    TweenSvc:Create(startStopBtn,TweenInfo.new(0.1),{BackgroundColor3=c}):Play()
+end)
+startStopBtn.MouseLeave:Connect(function()
+    local c=farmEnabled and RED or GREEN
+    TweenSvc:Create(startStopBtn,TweenInfo.new(0.1),{BackgroundColor3=c}):Play()
+end)
+
+-- Close ✕ and minimize button floating on title strip
+local minimized = false
+local minBtn=Instance.new("TextButton",titleBar)
+minBtn.Text="─"; minBtn.Font=Enum.Font.GothamBold; minBtn.TextSize=11
+minBtn.TextColor3=WHITE; minBtn.BackgroundColor3=Color3.fromRGB(60,60,70)
+minBtn.Size=UDim2.new(0,24,0,22); minBtn.Position=UDim2.new(1,-56,0.5,-11); minBtn.BorderSizePixel=0; minBtn.AutoButtonColor=false
+Instance.new("UICorner",minBtn).CornerRadius=UDim.new(0,5)
+minBtn.MouseButton1Click:Connect(function()
+    minimized=not minimized
+    minBtn.Text=minimized and "□" or "─"
+    for _,p in pairs(pages) do
+        p.Visible = not minimized and (p.Name==activeTabName)
+    end
+    tabStrip.Visible=not minimized
+end)
+
+-- ── CONFIG PAGE ───────────────────────────────────────────────
+local function cfgLbl(text,order) return mkLbl(CONFIG_PAGE,text,CYAN,order) end
+
+local function numRow(parent, label, key, mn, mx, order)
+    local row=Instance.new("Frame",parent); row.Size=UDim2.new(1,0,0,28); row.BackgroundColor3=Color3.fromRGB(36,36,42); row.BorderSizePixel=0; row.LayoutOrder=order
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,6)
+    local ll=Instance.new("TextLabel",row); ll.Text=label..": "..CFG[key]; ll.Font=Enum.Font.GothamBold; ll.TextSize=11; ll.TextColor3=WHITE; ll.BackgroundTransparency=1; ll.Size=UDim2.new(0.62,0,1,0); ll.Position=UDim2.new(0,8,0,0); ll.TextXAlignment=Enum.TextXAlignment.Left
+    local mb=Instance.new("TextButton",row); mb.Text="-"; mb.Font=Enum.Font.GothamBold; mb.TextSize=14; mb.TextColor3=WHITE; mb.BackgroundColor3=Color3.fromRGB(60,60,70); mb.Size=UDim2.new(0,26,0,22); mb.Position=UDim2.new(1,-56,0.5,-11); mb.BorderSizePixel=0; mb.AutoButtonColor=false; Instance.new("UICorner",mb).CornerRadius=UDim.new(0,5)
+    local ab=Instance.new("TextButton",row); ab.Text="+"; ab.Font=Enum.Font.GothamBold; ab.TextSize=14; ab.TextColor3=WHITE; ab.BackgroundColor3=Color3.fromRGB(60,60,70); ab.Size=UDim2.new(0,26,0,22); ab.Position=UDim2.new(1,-28,0.5,-11); ab.BorderSizePixel=0; ab.AutoButtonColor=false; Instance.new("UICorner",ab).CornerRadius=UDim.new(0,5)
+    mb.MouseButton1Click:Connect(function() CFG[key]=math.max(mn,CFG[key]-0.5); ll.Text=label..": "..CFG[key] end)
+    ab.MouseButton1Click:Connect(function() CFG[key]=math.min(mx,CFG[key]+0.5); ll.Text=label..": "..CFG[key] end)
 end
 
--- Override live loop properly:
+cfgLbl("⏱ Timing",1)
+numRow(CONFIG_PAGE,"Water Wait",   "waterWait",   10,60,2)
+numRow(CONFIG_PAGE,"Sugar Wait",   "sugarWait",   0,10, 3)
+numRow(CONFIG_PAGE,"Gelatin Wait", "gelatinWait", 30,90,4)
+cfgLbl("⚙ Options",5)
+mkToggle(CONFIG_PAGE,"Jitter",         GREEN,6,function(v) CFG.jitter=v end)
+mkToggle(CONFIG_PAGE,"Micro Movements",GREEN,7,function(v) CFG.microMove=v; if farmEnabled then if v then startMicroMove() else stopMicroMove() end end end)
+mkToggle(CONFIG_PAGE,"Auto Underground",GREEN,8,function(v) CFG.autoUG=v end)
+cfgLbl("💰 Sell Prices",9)
+local function priceRow(name,key,order)
+    local row=Instance.new("Frame",CONFIG_PAGE); row.Size=UDim2.new(1,0,0,28); row.BackgroundColor3=Color3.fromRGB(36,36,42); row.BorderSizePixel=0; row.LayoutOrder=order
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,6)
+    local ll=Instance.new("TextLabel",row); ll.Text=name..": $"..PRICES[key]; ll.Font=Enum.Font.GothamBold; ll.TextSize=11; ll.TextColor3=WHITE; ll.BackgroundTransparency=1; ll.Size=UDim2.new(0.62,0,1,0); ll.Position=UDim2.new(0,8,0,0); ll.TextXAlignment=Enum.TextXAlignment.Left
+    local mb=Instance.new("TextButton",row); mb.Text="-"; mb.Font=Enum.Font.GothamBold; mb.TextSize=14; mb.TextColor3=WHITE; mb.BackgroundColor3=Color3.fromRGB(60,60,70); mb.Size=UDim2.new(0,26,0,22); mb.Position=UDim2.new(1,-56,0.5,-11); mb.BorderSizePixel=0; mb.AutoButtonColor=false; Instance.new("UICorner",mb).CornerRadius=UDim.new(0,5)
+    local ab=Instance.new("TextButton",row); ab.Text="+"; ab.Font=Enum.Font.GothamBold; ab.TextSize=14; ab.TextColor3=WHITE; ab.BackgroundColor3=Color3.fromRGB(60,60,70); ab.Size=UDim2.new(0,26,0,22); ab.Position=UDim2.new(1,-28,0.5,-11); ab.BorderSizePixel=0; ab.AutoButtonColor=false; Instance.new("UICorner",ab).CornerRadius=UDim.new(0,5)
+    mb.MouseButton1Click:Connect(function() PRICES[key]=math.max(0,PRICES[key]-10); ll.Text=name..": $"..PRICES[key] end)
+    ab.MouseButton1Click:Connect(function() PRICES[key]=PRICES[key]+10; ll.Text=name..": $"..PRICES[key] end)
+end
+priceRow("Small","Small",10); priceRow("Medium","Medium",11); priceRow("Large","Large",12)
+
+-- ── WEBHOOK PAGE ──────────────────────────────────────────────
+mkLbl(WEBHOOK_PAGE,"Discord Webhook URL",CYAN,1)
+local whFrame=Instance.new("Frame",WEBHOOK_PAGE); whFrame.Size=UDim2.new(1,0,0,30); whFrame.BackgroundColor3=Color3.fromRGB(36,36,42); whFrame.BorderSizePixel=0; whFrame.LayoutOrder=2; Instance.new("UICorner",whFrame).CornerRadius=UDim.new(0,6)
+local whBox=Instance.new("TextBox",whFrame); whBox.Text=""; whBox.PlaceholderText="https://discord.com/api/webhooks/..."; whBox.Font=Enum.Font.Gotham; whBox.TextSize=10; whBox.TextColor3=WHITE; whBox.PlaceholderColor3=MUTE; whBox.BackgroundTransparency=1; whBox.Size=UDim2.new(1,-10,1,0); whBox.Position=UDim2.new(0,5,0,0); whBox.TextXAlignment=Enum.TextXAlignment.Left; whBox.ClearTextOnFocus=false
+whBox:GetPropertyChangedSignal("Text"):Connect(function() WEBHOOK_URL=whBox.Text end)
+
+mkLbl(WEBHOOK_PAGE,"Every N batches:",MUTE,3)
+local nrow=Instance.new("Frame",WEBHOOK_PAGE); nrow.Size=UDim2.new(1,0,0,28); nrow.BackgroundColor3=Color3.fromRGB(36,36,42); nrow.BorderSizePixel=0; nrow.LayoutOrder=4; Instance.new("UICorner",nrow).CornerRadius=UDim.new(0,6)
+local nlbl=Instance.new("TextLabel",nrow); nlbl.Text="Every "..CFG.webhookBatches.." batches"; nlbl.Font=Enum.Font.GothamBold; nlbl.TextSize=11; nlbl.TextColor3=WHITE; nlbl.BackgroundTransparency=1; nlbl.Size=UDim2.new(0.65,0,1,0); nlbl.Position=UDim2.new(0,8,0,0); nlbl.TextXAlignment=Enum.TextXAlignment.Left
+local nmb=Instance.new("TextButton",nrow); nmb.Text="-"; nmb.Font=Enum.Font.GothamBold; nmb.TextSize=14; nmb.TextColor3=WHITE; nmb.BackgroundColor3=Color3.fromRGB(60,60,70); nmb.Size=UDim2.new(0,26,0,22); nmb.Position=UDim2.new(1,-56,0.5,-11); nmb.BorderSizePixel=0; nmb.AutoButtonColor=false; Instance.new("UICorner",nmb).CornerRadius=UDim.new(0,5)
+local nab=Instance.new("TextButton",nrow); nab.Text="+"; nab.Font=Enum.Font.GothamBold; nab.TextSize=14; nab.TextColor3=WHITE; nab.BackgroundColor3=Color3.fromRGB(60,60,70); nab.Size=UDim2.new(0,26,0,22); nab.Position=UDim2.new(1,-28,0.5,-11); nab.BorderSizePixel=0; nab.AutoButtonColor=false; Instance.new("UICorner",nab).CornerRadius=UDim.new(0,5)
+nmb.MouseButton1Click:Connect(function() CFG.webhookBatches=math.max(1,CFG.webhookBatches-1); nlbl.Text="Every "..CFG.webhookBatches.." batches" end)
+nab.MouseButton1Click:Connect(function() CFG.webhookBatches+=1; nlbl.Text="Every "..CFG.webhookBatches.." batches" end)
+
+mkBtn(WEBHOOK_PAGE,"📨 Test Webhook",BLUE,5,function()
+    if WEBHOOK_URL=="" then mkLbl(WEBHOOK_PAGE,"⚠ Enter URL first",RED,98); return end
+    sendWebhook("✅ Test from C3 AutoMS — webhook working!")
+end)
+mkBtn(WEBHOOK_PAGE,"📊 Send Stats Now",GREEN,6,function() sendWebhook("📊 Manual stats report") end)
+local whStatus=mkLbl(WEBHOOK_PAGE,"⚠ No webhook set",MUTE,7)
+task.spawn(function()
+    while SG.Parent do
+        if WEBHOOK_URL~="" then whStatus.Text="✅ Webhook set"; whStatus.TextColor3=Color3.fromRGB(100,255,130)
+        else whStatus.Text="⚠ No webhook set"; whStatus.TextColor3=MUTE end
+        task.wait(1)
+    end
+end)
+
+-- ── LIVE STATS UPDATE ─────────────────────────────────────────
 task.spawn(function()
     while SG.Parent do
         local now=tick()
-        -- step bar
+        lStatus.Text="status: "..stats.status
         if stats.stepEnd then
             local rem=math.max(0,stats.stepEnd-now)
-            local tot=math.max(stats.stepTotal,1)
-            local pct=math.clamp(1-rem/tot,0,1)
-            stepFill.Size=UDim2.new(pct,0,1,0)
-            stepLbl.Text=string.format("step: %.1fs",rem)
-            stepPct.Text=string.format("%d%%",math.floor(pct*100))
-            stepLbl.TextColor3=rem<5 and C.red or C.acc
-        else
-            stepFill.Size=UDim2.new(0,0,1,0)
-            stepLbl.Text="step: --"; stepPct.Text=""
-        end
-        -- cook
+            local pct=math.floor((1-rem/math.max(stats.stepTotal,1))*100)
+            lTimer.Text=string.format("step:   %.1fs [%d%%]",rem,pct)
+            lTimer.TextColor3=rem<5 and Color3.fromRGB(255,80,80) or YELLOW
+        else lTimer.Text="step:   --"; lTimer.TextColor3=YELLOW end
         if stats.cookStart then
             local e=math.floor(now-stats.cookStart)
-            setStatLabel("cooktime",string.format("%d:%02d",math.floor(e/60),e%60))
-        else setStatLabel("cooktime","--") end
-        -- avg
-        if stats.cookCount and stats.cookCount>0 then
+            lCookTime.Text=string.format("cook:   %d:%02d",math.floor(e/60),e%60)
+        else lCookTime.Text="cook:   --" end
+        if stats.cookCount>0 then
             local avg=math.floor(stats.totalCookSecs/stats.cookCount)
-            setStatLabel("avgcook",string.format("%d:%02d",math.floor(avg/60),avg%60))
-        else setStatLabel("avgcook","--") end
-        -- uptime
-        local s=math.floor(stats.farmUptime+(stats.farmStarted and now-stats.farmStarted or 0))
-        setStatLabel("uptime",string.format("%d:%02d",math.floor(s/60),s%60))
-        -- counts
-        setStatLabel("small",stats.small)
-        setStatLabel("medium",stats.medium)
-        setStatLabel("large",stats.large)
-        -- mini stats
-        local _b=stats.small+stats.medium+stats.large
-        stats.batches=_b
-        if miniStatLabels["batches"] then miniStatLabels["batches"].Text=tostring(_b) end
-        if miniStatLabels["earned"]  then miniStatLabels["earned"].Text="$"..tostring(stats.earned) end
-        if miniStatLabels["inbag"]   then miniStatLabels["inbag"].Text=tostring(countMarshmallowInv()) end
-        if miniStatLabels["failed"]  then miniStatLabels["failed"].Text=tostring(stats.failed) end
-        -- status badge
-        if farmEnabled then
-            titleBadge.BackgroundColor3=loopEnabled and Color3.fromRGB(20,40,100) or Color3.fromRGB(20,80,30)
-            titleBadgeLbl.Text=loopEnabled and "loop" or "farm"
-            titleBadgeLbl.TextColor3=loopEnabled and C.blue or C.green
-        else
-            titleBadge.BackgroundColor3=C.mute
-            titleBadgeLbl.Text="idle"
-            titleBadgeLbl.TextColor3=C.sub
-        end
-        -- push status to log on change
-        if lStatus_main.Text~=stats.status then
-            lStatus_main.Text=stats.status
-            pushLog(stats.status)
-        end
+            lAvgCook.Text=string.format("avg:    %d:%02d",math.floor(avg/60),avg%60)
+        else lAvgCook.Text="avg:    --" end
+        local s=math.floor(stats.farmUptime + (stats.farmStarted and tick()-stats.farmStarted or 0))
+        lSession.Text=string.format("uptime: %d:%02d",math.floor(s/60),s%60)
+        lBatches.Text="done:   "..stats.batches
+        lSmall.Text  ="small:  "..stats.small
+        lMedium.Text ="medium: "..stats.medium
+        lLarge.Text  ="large:  "..stats.large
+        lInBag.Text  ="in bag: "..countMarshmallowInv()
+        lLastBag.Text="last:   "..(stats.lastBatch~="" and stats.lastBatch or "--")
+        if #stats.batchLog>0 then lLog.Text="log:    "..table.concat(stats.batchLog," ") end
         refreshInv()
         task.wait(0.2)
     end
 end)
 
--- Hook logBatch to push to GUI log
-local _origLogBatch=logBatch
-logBatch=function(size)
-    _origLogBatch(size)
-    pushLog("cooked "..size:lower().." ms")
+-- ── RECORDER PAGE ─────────────────────────────────────────────
+local RECORDER_PAGE = makePage("Recorder",4)
+RECORDER_PAGE.Visible = false
+
+local WATCH_KEYS = {
+    Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+    Enum.KeyCode.Space, Enum.KeyCode.LeftShift, Enum.KeyCode.E, Enum.KeyCode.F,
+    Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four,
+}
+
+local Rec = {
+    Recording = false,
+    Playing   = false,
+    Frames    = {},
+    Conn      = nil,
+    PlayIdx   = 0,
+    Repeating = false,
+    RepeatCount = 1,
+    CurrentRep  = 0,
+    PrevHeld  = {},
+}
+
+local function fireKey(down, kc)
+    pcall(function() VIM:SendKeyEvent(down, kc, false, game) end)
 end
 
+local function releaseAllKeys()
+    for _,kc in ipairs(WATCH_KEYS) do fireKey(false, kc) end
+    pcall(function()
+        local mp = UIS:GetMouseLocation()
+        VIM:SendMouseButtonEvent(mp.X,mp.Y,0,false,game,0)
+        VIM:SendMouseButtonEvent(mp.X,mp.Y,1,false,game,0)
+    end)
+    Rec.PrevHeld = {}
+end
+
+-- Status labels
+local recStatusLbl = mkLbl(RECORDER_PAGE, "● idle", MUTE, 1)
+local recFramesLbl = mkLbl(RECORDER_PAGE, "0 frames", MUTE, 2)
+
+local function updRecStatus()
+    if Rec.Recording then
+        recStatusLbl.Text = "● recording"; recStatusLbl.TextColor3 = RED
+        recFramesLbl.Text = #Rec.Frames.." frames"
+    elseif Rec.Playing then
+        recStatusLbl.Text = "▶ playing"; recStatusLbl.TextColor3 = GREEN
+        recFramesLbl.Text = "frame "..Rec.PlayIdx.."/"..#Rec.Frames.." — rep "..Rec.CurrentRep.."/"..Rec.RepeatCount
+    else
+        recStatusLbl.Text = "● idle"; recStatusLbl.TextColor3 = MUTE
+        recFramesLbl.Text = #Rec.Frames.." frames saved"
+    end
+end
+
+local function stopAll()
+    Rec.Recording = false; Rec.Playing = false; Rec.Repeating = false
+    if Rec.Conn then Rec.Conn:Disconnect(); Rec.Conn = nil end
+    releaseAllKeys(); updRecStatus()
+end
+
+-- Record button
+local recBtn = mkBtn(RECORDER_PAGE, "⏺  Record", DKGREY, 3)
+recBtn.MouseButton1Click:Connect(function()
+    if Rec.Recording then
+        -- Stop recording
+        Rec.Recording = false
+        if Rec.Conn then Rec.Conn:Disconnect(); Rec.Conn = nil end
+        recBtn.Text = "⏺  Record"; recBtn.BackgroundColor3 = DKGREY
+        updRecStatus()
+    else
+        -- Start recording
+        stopAll(); Rec.Frames = {}; Rec.Recording = true
+        recBtn.Text = "⏹  Stop Recording"; recBtn.BackgroundColor3 = RED
+        Rec.Conn = RunService.RenderStepped:Connect(function()
+            if not Rec.Recording then return end
+            local held = {}
+            for _,kc in ipairs(WATCH_KEYS) do held[kc] = UIS:IsKeyDown(kc) end
+            held["MB1"] = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+            local mp = UIS:GetMouseLocation(); held["MX"] = mp.X; held["MY"] = mp.Y
+            table.insert(Rec.Frames, held)
+            updRecStatus()
+        end)
+    end
+end)
+
+-- Play once button
+local playBtn = mkBtn(RECORDER_PAGE, "▶  Play Once", BLUE, 4)
+playBtn.MouseButton1Click:Connect(function()
+    if #Rec.Frames == 0 then return end
+    if Rec.Playing then stopAll(); playBtn.Text="▶  Play Once"; return end
+    stopAll(); Rec.Playing = true; Rec.PlayIdx = 0; Rec.PrevHeld = {}
+    Rec.CurrentRep = 1; Rec.RepeatCount = 1; Rec.Repeating = false
+    playBtn.Text = "⏹  Stop"
+    Rec.Conn = RunService.RenderStepped:Connect(function()
+        if not Rec.Playing then return end
+        Rec.PlayIdx += 1
+        if Rec.PlayIdx > #Rec.Frames then
+            stopAll(); playBtn.Text = "▶  Play Once"; return
+        end
+        local frame = Rec.Frames[Rec.PlayIdx]
+        pcall(function() VIM:SendMouseMoveEvent(frame["MX"] or 0, frame["MY"] or 0, game) end)
+        for _,kc in ipairs(WATCH_KEYS) do
+            local was = Rec.PrevHeld[kc] or false; local now = frame[kc] or false
+            if now and not was then fireKey(true,kc) elseif not now and was then fireKey(false,kc) end
+        end
+        local wasMB1 = Rec.PrevHeld["MB1"] or false; local nowMB1 = frame["MB1"] or false
+        if nowMB1 and not wasMB1 then
+            pcall(function() VIM:SendMouseButtonEvent(frame["MX"],frame["MY"],0,true,game,0) end)
+        elseif not nowMB1 and wasMB1 then
+            pcall(function() VIM:SendMouseButtonEvent(frame["MX"],frame["MY"],0,false,game,0) end)
+        end
+        Rec.PrevHeld = frame
+        updRecStatus()
+    end)
+end)
+
+-- Repeat toggle
+local repeatEnabled = false
+local repeatBtn = mkBtn(RECORDER_PAGE, "🔁  Auto Repeat: OFF", DKGREY, 5)
+repeatBtn.MouseButton1Click:Connect(function()
+    repeatEnabled = not repeatEnabled
+    repeatBtn.Text = "🔁  Auto Repeat: "..(repeatEnabled and "ON" or "OFF")
+    repeatBtn.BackgroundColor3 = repeatEnabled and GREEN or DKGREY
+end)
+
+-- Repeat loop button
+local loopRepBtn = mkBtn(RECORDER_PAGE, "▶  Start Repeat Loop", GREEN, 6)
+loopRepBtn.MouseButton1Click:Connect(function()
+    if #Rec.Frames == 0 then return end
+    if Rec.Playing and Rec.Repeating then
+        stopAll(); loopRepBtn.Text="▶  Start Repeat Loop"; loopRepBtn.BackgroundColor3=GREEN; return
+    end
+    stopAll(); Rec.Playing=true; Rec.Repeating=true; Rec.PlayIdx=0; Rec.PrevHeld={}; Rec.CurrentRep=1
+    loopRepBtn.Text="⏹  Stop Loop"; loopRepBtn.BackgroundColor3=RED
+    Rec.Conn=RunService.RenderStepped:Connect(function()
+        if not Rec.Playing then return end
+        Rec.PlayIdx+=1
+        if Rec.PlayIdx>#Rec.Frames then
+            releaseAllKeys(); Rec.PlayIdx=1; Rec.CurrentRep+=1; task.wait(0.2)
+        end
+        if Rec.PlayIdx>#Rec.Frames then return end
+        local frame=Rec.Frames[Rec.PlayIdx]
+        pcall(function() VIM:SendMouseMoveEvent(frame["MX"] or 0,frame["MY"] or 0,game) end)
+        for _,kc in ipairs(WATCH_KEYS) do
+            local was=Rec.PrevHeld[kc] or false; local now=frame[kc] or false
+            if now and not was then fireKey(true,kc) elseif not now and was then fireKey(false,kc) end
+        end
+        local wasMB1=Rec.PrevHeld["MB1"] or false; local nowMB1=frame["MB1"] or false
+        if nowMB1 and not wasMB1 then
+            pcall(function() VIM:SendMouseButtonEvent(frame["MX"],frame["MY"],0,true,game,0) end)
+        elseif not nowMB1 and wasMB1 then
+            pcall(function() VIM:SendMouseButtonEvent(frame["MX"],frame["MY"],0,false,game,0) end)
+        end
+        Rec.PrevHeld=frame; updRecStatus()
+    end)
+end)
+
+-- Clear button
+mkBtn(RECORDER_PAGE, "✕  Clear Recording", DKGREY, 7, function()
+    stopAll(); Rec.Frames={}; updRecStatus()
+    recBtn.Text="⏺  Record"; recBtn.BackgroundColor3=DKGREY
+    playBtn.Text="▶  Play Once"; playBtn.BackgroundColor3=BLUE
+    loopRepBtn.Text="▶  Start Repeat Loop"; loopRepBtn.BackgroundColor3=GREEN
+end)
+
+-- Info label
+local infoLbl = mkLbl(RECORDER_PAGE, "record your buy clicks then loop to repeat", MUTE, 8)
+infoLbl.TextSize = 9
+
+pages["Recorder"] = RECORDER_PAGE
+
 -- ── INIT ──────────────────────────────────────────────────────
-switchTab("farm")
+-- Force immediate inventory read so labels aren't 0 on execute
+task.spawn(function()
+    task.wait(0.5)
+    refreshInv()
+end)
 
 game:GetService("StarterGui"):SetCore("SendNotification",{
     Title="[C3]", Text="AutoMS loaded", Duration=3,

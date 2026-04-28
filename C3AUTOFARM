@@ -344,26 +344,25 @@ local function logBatch(size)
 end
 
 -- ── PERSISTENT MARSHMALLOW WATCHER ────────────────────────────
-local selling = false -- true while doSell is running, blocks watcher
-local seenBags = {} -- track bag instances we've already counted
+local selling = false
+local seenBags = {}
 
 local function onMSAdded(item)
     if not item:IsA("Tool") then return end
     local n=item.Name:lower()
     if not (n:find("marshmallow") or n:find("marsh")) then return end
-    if farmEnabled then return end -- farm handles its own counting
-    if selling then return end     -- ignore items moving around during sell
-    if seenBags[item] then return end -- already counted this bag
+    if selling then return end
+    if seenBags[item] then return end
     seenBags[item]=true
-    -- clean up when bag is removed
     item.AncestryChanged:Connect(function()
         if not item:IsDescendantOf(game) then seenBags[item]=nil end
     end)
-    local size = getSizeFromName(item.Name)
+    local size=getSizeFromName(item.Name)
     if size=="Large" then stats.large+=1
     elseif size=="Medium" then stats.medium+=1
     else stats.small+=1 end
-    stats.batches+=1
+    -- batches always = total bags cooked/collected
+    stats.batches=stats.small+stats.medium+stats.large
     logBatch(size)
     setStatus("got "..size:lower().." ms!")
 end
@@ -493,12 +492,15 @@ local function doCook()
         if gotSize=="Large" then stats.large+=1
         elseif gotSize=="Medium" then stats.medium+=1
         else stats.small+=1 end
+        stats.batches=stats.small+stats.medium+stats.large
         logBatch(gotSize)
-        task.wait(0.5) -- wait for marshmallow to actually land in backpack
-        setStatus("✅ Got "..gotSize.." MS!")
+        task.wait(0.5)
+        setStatus("got "..gotSize:lower().." ms!")
     else
-        setStatus("⚠ Collected (unknown size)")
-        stats.small+=1; logBatch("?")
+        setStatus("collected (unknown size)")
+        stats.small+=1
+        stats.batches=stats.small+stats.medium+stats.large
+        logBatch("?")
     end
 
     -- Track average cook time
@@ -519,45 +521,50 @@ end
 
 -- ── SELL ──────────────────────────────────────────────────────
 doSell = function()
-    local totalBefore=countMarshmallowInv()
-    if totalBefore==0 then setStatus("Nothing to sell"); return end
-    selling = true -- block watcher
+    local bags=getMarshmallows()
+    if #bags==0 then setStatus("nothing to sell"); return end
+    selling=true
     directTP(SELLER_POS); task.wait(0.6)
-    local sold=0
-    local ms=getMarshmallows()
-    while #ms>0 do
-        local item=ms[1]
-        -- Determine size and price BEFORE selling
-        local itemName=item.Name
-        local sz=getSizeFromName(itemName)
+    local soldCount=0
+    local earnedThisSell=0
+
+    -- sell one bag at a time, track by watching if it leaves the game
+    local toSell=getMarshmallows()
+    for _,item in ipairs(toSell) do
+        if not item:IsDescendantOf(game) then continue end
+        local sz=getSizeFromName(item.Name)
         local price=PRICES[sz] or PRICES.Small
-        -- Equip
+        -- equip
         local hum=LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
-        if item.Parent~=LP.Character and hum then
+        if hum and item.Parent~=LP.Character then
             pcall(function() hum:EquipTool(item) end)
-            task.wait(0.1)
+            task.wait(0.15)
         end
-        if item.Parent~=LP.Character then
-            pcall(function() item.Parent=LP.Character end)
-            task.wait(0.1)
-        end
-        -- Count TOTAL bags before E press (backpack + char combined)
-        local totalBefore2=countMarshmallowInv()
+        -- press E and wait for item to leave the game entirely
         pressE()
-        task.wait(0.5)
-        local totalAfter2=countMarshmallowInv()
-        -- Bag successfully sold if total went down
-        if totalAfter2 < totalBefore2 then
-            stats.earned+=price
-            sold+=1
+        local gone=false
+        for _=1,10 do
+            task.wait(0.1)
+            if not item:IsDescendantOf(game) then gone=true; break end
         end
-        ms=getMarshmallows()
-        if not farmEnabled and sold>0 then break end
+        if gone then
+            stats.earned+=price
+            earnedThisSell+=price
+            soldCount+=1
+            -- subtract from size counts and sync batches
+            if sz=="Large" then stats.large=math.max(0,stats.large-1)
+            elseif sz=="Medium" then stats.medium=math.max(0,stats.medium-1)
+            else stats.small=math.max(0,stats.small-1) end
+            stats.batches=stats.small+stats.medium+stats.large
+            pushLog("sold "..sz:lower().." ms  +$"..price)
+            setStatus("sold "..sz:lower().." ms +$"..price)
+        end
+        task.wait(0.1)
     end
-    local actuallySold=totalBefore-countMarshmallowInv()
-    setStatus("sold "..actuallySold.." bag"..(actuallySold~=1 and "s" or ""))
+
     unequipAll()
-    selling = false -- allow watcher again
+    selling=false
+    setStatus("sold "..soldCount.." bag"..(soldCount~=1 and "s" or "").." +$"..earnedThisSell)
 end
 
 -- ── BUY ───────────────────────────────────────────────────────
@@ -1885,12 +1892,11 @@ task.spawn(function()
     end
 end)
 
--- ── AUTO SELL toggle (was in old GUI) ─────────────────────────
--- Hook into logBatch to push to new log
+-- Hook logBatch to push to GUI log
 local _origLogBatch=logBatch
 logBatch=function(size)
     _origLogBatch(size)
-    pushLog("✓ got "..size:lower().." ms  ($"..PRICES[size]..")")
+    pushLog("cooked "..size:lower().." ms")
 end
 
 -- ── INIT ──────────────────────────────────────────────────────

@@ -1,0 +1,1888 @@
+--[[
+    C3 AutoMS — Top Tier Marshmallow Farm
+    Console servers — PlaceId 15124180230
+    Features: Watchdog, retry logic, death recovery, parallel buy,
+              profit tracking, success rate, anti-detection jitter,
+              micro-movements, Discord webhook, config panel
+]]
+
+if game.PlaceId ~= 15124180230 then
+    game:GetService("Players").LocalPlayer:Kick("unsupported game"); return
+end
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenSvc   = game:GetService("TweenService")
+local UIS        = game:GetService("UserInputService")
+local VIM        = game:GetService("VirtualInputManager")
+local HttpSvc    = game:GetService("HttpService")
+local LP         = Players.LocalPlayer
+local Cam        = workspace.CurrentCamera
+
+pcall(function()
+    for _,n in ipairs({"C3AutoMS"}) do
+        local a=game:GetService("CoreGui"):FindFirstChild(n); if a then a:Destroy() end
+        local b=LP:WaitForChild("PlayerGui"):FindFirstChild(n); if b then b:Destroy() end
+    end
+end)
+
+local _hui = LP:WaitForChild("PlayerGui")
+pcall(function() local h=gethui(); if h then _hui=h end end)
+
+local SG = Instance.new("ScreenGui")
+SG.Name="C3AutoMS"; SG.ResetOnSpawn=false
+SG.ZIndexBehavior=Enum.ZIndexBehavior.Global
+SG.IgnoreGuiInset=true; SG.DisplayOrder=9992; SG.Parent=_hui
+pcall(function() syn.protect_gui(SG) end)
+pcall(function() protect_gui(SG) end)
+
+pcall(function()
+    local p=workspace.Map.Houses.WH1.Exterior:FindFirstChild("housed.0052")
+    if p then p:Destroy() end
+end)
+
+-- ── CONSTANTS ─────────────────────────────────────────────────
+local SELLER_POS   = Vector3.new(510.0, 4.0, 601.0)
+local COOK_POS     = Vector3.new(510.0, 4.0, 601.0) -- update if needed
+local savedCookPos = nil -- saved automatically when farm starts
+local WIN_W        = 290
+local PRICES       = {Small=1470, Medium=2840, Large=4150}
+local ITEM_COSTS   = {Water=20, ["Sugar Block Bag"]=100, Gelatin=70}
+local WEBHOOK_URL  = "" -- set via GUI
+
+-- ── CONFIG (adjustable via panel) ─────────────────────────────
+local CFG = {
+    waterWait   = 22,
+    sugarWait   = 2.5,
+    gelatinWait = 47,
+    retryMax    = 3,
+    watchdogSec = 90,
+    jitter      = false,  -- random small delays
+    microMove   = false,  -- micro-movements while waiting
+    autoUG      = false,  -- auto-underground on start
+    webhookBatches = 5,   -- send webhook every N batches
+}
+
+-- ── STATE ─────────────────────────────────────────────────────
+local farmEnabled  = false
+local loopEnabled  = false
+local farmThread   = nil
+local watchThread  = nil
+local moveThread   = nil
+local afkThread    = nil
+local autoSell     = false
+local antiDeath    = false
+local antiAFK      = false
+local ctrlDelete   = false
+local isUG         = false
+local ugPlatform   = nil
+local ugOrigCF     = nil
+local ugDist       = 7.4
+local Dragging     = false
+local DragOff      = Vector2.new()
+local lastStatusChange = tick()
+local lastStatus   = ""
+
+local stats = {
+    status       = "Idle",
+    batches      = 0,
+    failed       = 0,
+    small        = 0,
+    medium       = 0,
+    large        = 0,
+    earned       = 0,
+    spent        = 0,
+    sessionStart = tick(),
+    farmUptime   = 0,    -- total seconds farm has been running
+    farmStarted  = nil,  -- tick() when farm last started
+    cookStart    = nil,
+    stepEnd      = nil,
+    stepTotal    = 0,
+    lastBatch    = "",
+    batchLog     = {},  -- last 5
+    lastBatch    = "",  -- real name of last bag received
+    totalCookSecs= 0,   -- sum of all cook durations for average
+    cookCount    = 0,   -- number of completed cooks (for average)
+}
+
+-- ── HELPERS ───────────────────────────────────────────────────
+local function jitter()
+    if CFG.jitter then task.wait(math.random(5,15)/100) end
+end
+
+local lStatus -- forward declare so setStatus can write to it directly
+local function setStatus(s)
+    stats.status = s
+    if lStatus then pcall(function() lStatus.Text="status: "..s end) end
+    if s ~= lastStatus then
+        lastStatus = s
+        lastStatusChange = tick()
+    end
+end
+
+local function getSizeFromName(name)
+    local n=name:lower()
+    if n:find("large") then return "Large"
+    elseif n:find("medium") then return "Medium"
+    elseif n:find("small") then return "Small"
+    else return "Small" end
+end
+
+local function countInv(name)
+    local n=0
+    local search=name:lower():gsub("%s+","")
+    pcall(function()
+        for _,v in ipairs(LP.Backpack:GetChildren()) do
+            if v:IsA("Tool") and v.Name:lower():gsub("%s+","")==search then n+=1 end
+        end
+        if LP.Character then
+            for _,v in ipairs(LP.Character:GetChildren()) do
+                if v:IsA("Tool") and v.Name:lower():gsub("%s+","")==search then n+=1 end
+            end
+        end
+    end)
+    return n
+end
+
+local function getMarshmallows()
+    local items={}
+    local function scan(c) if not c then return end
+        for _,v in ipairs(c:GetChildren()) do
+            if v:IsA("Tool") then
+                local n=v.Name:lower()
+                if n:find("marshmallow") or n:find("marsh") then table.insert(items,v) end
+            end
+        end
+    end
+    scan(LP.Backpack); if LP.Character then scan(LP.Character) end
+    return items
+end
+
+local function countMarshmallowInv()
+    return #getMarshmallows()
+end
+
+local function directTP(pos)
+    local c=LP.Character; if not c then return end
+    local r=c:FindFirstChild("HumanoidRootPart"); if not r then return end
+    r.CFrame=CFrame.new(pos); r.AssemblyLinearVelocity=Vector3.zero
+end
+
+local function pressE()
+    jitter()
+    VIM:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
+    task.wait(0.1 + (CFG.jitter and math.random(0,5)/100 or 0))
+    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    jitter()
+end
+
+local function playErrorSound()
+    pcall(function()
+        local s=Instance.new("Sound", workspace)
+        s.SoundId="rbxassetid://131961136" -- error ding
+        s.Volume=0.5; s.RollOffMaxDistance=0; s:Play()
+        game:GetService("Debris"):AddItem(s, 3)
+    end)
+end
+
+local function unequipAll()
+    local c=LP.Character; if not c then return end
+    local hum=c:FindFirstChildOfClass("Humanoid"); if not hum then return end
+    pcall(function() hum:UnequipTools() end)
+    task.wait(0.15)
+end
+
+local function equipItem(name)
+    local c=LP.Character; if not c then return false end
+    if c:FindFirstChild(name) then return true end
+    local tool=LP.Backpack:FindFirstChild(name); if not tool then return false end
+    local hum=c:FindFirstChildOfClass("Humanoid"); if not hum then return false end
+    pcall(function() hum:EquipTool(tool) end)
+    task.wait(0.2); return c:FindFirstChild(name)~=nil
+end
+
+-- Retry equip up to CFG.retryMax times
+local function equipWithRetry(name)
+    for attempt=1,CFG.retryMax do
+        if equipItem(name) then return true end
+        setStatus("⚠ Retry equip "..name.." ("..attempt.."/"..CFG.retryMax..")")
+        task.wait(0.5)
+    end
+    return false
+end
+
+local function waitI(secs)
+    stats.stepEnd   = tick()+secs
+    stats.stepTotal = secs
+    local elapsed = 0
+    while farmEnabled and elapsed < secs do
+        task.wait(0.2); elapsed += 0.2
+    end
+    stats.stepEnd   = nil
+    stats.stepTotal = 0
+end
+
+-- Click a button visible on screen (PlayerGui only, no shop prompt)
+local function clickButton(itemName)
+    local search = itemName:lower()
+    for _=1,40 do
+        for _,v in ipairs(LP.PlayerGui:GetDescendants()) do
+            if v:IsA("TextButton") and v.Visible then
+                if v.Text:lower():find(search, 1, true) then
+                    pcall(function() v.MouseButton1Click:Fire() end)
+                    pcall(function()
+                        local pos=v.AbsolutePosition+v.AbsoluteSize*0.5
+                        VIM:SendMouseButtonEvent(pos.X,pos.Y,0,true,game,1)
+                        task.wait(0.05)
+                        VIM:SendMouseButtonEvent(pos.X,pos.Y,0,false,game,1)
+                    end)
+                    jitter(); unequipAll()
+                    return true
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+    return false
+end
+
+-- Cooking pot proximity prompts
+local function getCookPotPrompts()
+    local t={}
+    pcall(function()
+        local int=workspace.Map.Houses.WH1:FindFirstChild("Interior"); if not int then return end
+        for _,v in ipairs(int:GetDescendants()) do
+            if v:IsA("ProximityPrompt") then table.insert(t,v) end
+        end
+    end)
+    return t
+end
+
+local function setPromptSettings(dist,los)
+    for _,pp in ipairs(getCookPotPrompts()) do
+        pcall(function() pp.MaxActivationDistance=dist; pp.RequiresLineOfSight=los end)
+    end
+end
+
+-- Underground
+local function goUnderground()
+    local c=LP.Character; if not c then return end
+    local r=c:FindFirstChild("HumanoidRootPart"); if not r then return end
+    ugOrigCF=r.CFrame
+    local plat=Instance.new("Part"); plat.Name="C3_UG"; plat.Size=Vector3.new(10,1,10)
+    plat.Transparency=1; plat.Anchored=true; plat.CanCollide=true
+    plat.CFrame=r.CFrame-Vector3.new(0,ugDist,0); plat.Parent=workspace
+    ugPlatform=plat; task.wait(0.1)
+    r.CFrame=plat.CFrame+Vector3.new(0,3.5,0); isUG=true
+end
+
+local function goAboveground()
+    local c=LP.Character; if not c then return end
+    local r=c:FindFirstChild("HumanoidRootPart"); if not r then return end
+    if ugOrigCF then
+        r.CFrame=ugOrigCF
+    else
+        r.CFrame=CFrame.new(r.Position+Vector3.new(0,16,0))
+    end
+    if ugPlatform then ugPlatform:Destroy(); ugPlatform=nil end
+    isUG=false; ugOrigCF=nil
+end
+
+-- Discord webhook
+local function sendWebhook(msg)
+    if WEBHOOK_URL=="" then return end
+    task.spawn(function()
+        pcall(function()
+            local body=HttpSvc:JSONEncode({
+                embeds={{
+                    title="C3 AutoMS Update",
+                    description=msg,
+                    color=0xDC2D37,
+                    fields={
+                        {name="Batches",value=tostring(stats.batches),inline=true},
+                        {name="Small",value=tostring(stats.small),inline=true},
+                        {name="Medium",value=tostring(stats.medium),inline=true},
+                        {name="Large",value=tostring(stats.large),inline=true},
+                        {name="Est. Profit",value="$"..tostring(stats.earned-stats.spent),inline=true},
+                        {name="Player",value=LP.Name,inline=true},
+                    }
+                }}
+            })
+            local fn = http_request or (syn and syn.request) or request
+            if fn then
+                fn({Url=WEBHOOK_URL,Method="POST",Headers={["Content-Type"]="application/json"},Body=body})
+            end
+        end)
+    end)
+end
+
+-- Micro-movements while waiting (anti-AFK + anti-detection)
+local function startMicroMove()
+    if moveThread then task.cancel(moveThread); moveThread=nil end
+    if not CFG.microMove then return end
+    moveThread=task.spawn(function()
+        local keys={Enum.KeyCode.W,Enum.KeyCode.A,Enum.KeyCode.D}
+        while farmEnabled and CFG.microMove do
+            task.wait(math.random(8,15))
+            if not farmEnabled then break end
+            local k=keys[math.random(1,#keys)]
+            VIM:SendKeyEvent(true,k,false,game); task.wait(0.05+math.random(0,5)/100)
+            VIM:SendKeyEvent(false,k,false,game)
+        end
+    end)
+end
+
+local function stopMicroMove()
+    if moveThread then task.cancel(moveThread); moveThread=nil end
+end
+
+-- ── BATCH LOG ─────────────────────────────────────────────────
+local function logBatch(size)
+    table.insert(stats.batchLog, 1, size)
+    if #stats.batchLog>5 then table.remove(stats.batchLog) end
+    stats.lastBatch=size
+end
+
+-- ── PERSISTENT MARSHMALLOW WATCHER ────────────────────────────
+local selling = false -- true while doSell is running, blocks watcher
+
+local function onMSAdded(item)
+    if not item:IsA("Tool") then return end
+    local n=item.Name:lower()
+    if not (n:find("marshmallow") or n:find("marsh")) then return end
+    if farmEnabled then return end -- farm handles its own counting
+    if selling then return end     -- ignore items moving around during sell
+    local size = getSizeFromName(item.Name)
+    if size=="Large" then stats.large+=1
+    elseif size=="Medium" then stats.medium+=1
+    else stats.small+=1 end
+    stats.batches+=1
+    logBatch(size)
+    setStatus("✅ Got "..size.." MS! ("..item.Name..")")
+end
+
+LP.Backpack.ChildAdded:Connect(onMSAdded)
+LP.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    LP.Backpack.ChildAdded:Connect(onMSAdded)
+end)
+
+-- ── FORWARD DECLARATIONS ──────────────────────────────────────
+local doSell, doBuy
+
+-- ── COOK CYCLE ────────────────────────────────────────────────
+local function doCook()
+    stats.cookStart=tick()
+    local function fail(msg) playErrorSound(); setStatus(msg); stats.failed+=1; stats.cookStart=nil; return false end
+
+    -- Save cook position so we can return after selling/buying
+    local char=LP.Character; local root=char and char:FindFirstChild("HumanoidRootPart")
+    if root then savedCookPos=root.Position end
+
+    -- Auto-restock if missing ingredients before starting
+    local needRestock = countInv("Water")==0 or countInv("Sugar Block Bag")==0 or countInv("Gelatin")==0
+    if needRestock then
+        -- Sell any marshmallows we have before buying
+        local bags = getMarshmallows()
+        if #bags > 0 then
+            setStatus("⚠ Out of ingredients — selling first...")
+            doSell()
+            if not farmEnabled then stats.cookStart=nil; return false end
+        end
+        setStatus("⚠ Buying ingredients...")
+        doBuy()
+        if not farmEnabled then stats.cookStart=nil; return false end
+        -- Return to cook spot after buying
+        if savedCookPos then directTP(savedCookPos); task.wait(0.5) end
+    end
+
+    -- Step 1: Water
+    setStatus("Equipping Water...")
+    if not equipWithRetry("Water") then return fail("❌ No Water!") end
+    jitter(); pressE(); task.spawn(function() task.wait(0.3); refreshInv() end)
+    setStatus("⏳ Water cooking ("..CFG.waterWait.."s)")
+    waitI(CFG.waterWait)
+    if not farmEnabled then stats.cookStart=nil; return false end
+
+    -- Step 2: Sugar Block Bag
+    setStatus("Equipping Sugar Block Bag...")
+    if equipWithRetry("Sugar Block Bag") then
+        jitter(); pressE(); task.spawn(function() task.wait(0.3); refreshInv() end)
+        setStatus("⏳ Sugar animation ("..CFG.sugarWait.."s)")
+        waitI(CFG.sugarWait)
+        if not farmEnabled then stats.cookStart=nil; return false end
+    end
+
+    -- Step 3: Gelatin
+    setStatus("Equipping Gelatin...")
+    if equipWithRetry("Gelatin") then
+        jitter(); pressE(); task.spawn(function() task.wait(0.3); refreshInv() end)
+        setStatus("⏳ Cooking ("..CFG.gelatinWait.."s)")
+        waitI(CFG.gelatinWait)
+        if not farmEnabled then stats.cookStart=nil; return false end
+    end
+
+    -- Step 4: Empty Bag — wait up to 6s for it
+    setStatus("Waiting for Empty Bag...")
+    local w=0
+    while w<6 and farmEnabled do
+        if LP.Backpack:FindFirstChild("Empty Bag") or (LP.Character and LP.Character:FindFirstChild("Empty Bag")) then break end
+        task.wait(0.5); w+=0.5
+    end
+    if not farmEnabled then stats.cookStart=nil; return false end
+    if not LP.Backpack:FindFirstChild("Empty Bag") and not (LP.Character and LP.Character:FindFirstChild("Empty Bag")) then
+        return fail("⚠ No Empty Bag!")
+    end
+
+    -- Snapshot counts BEFORE pressing E
+    setStatus("Collecting marshmallow...")
+    local function countWord(word)
+        local n=0
+        local function scan(c) if not c then return end
+            for _,v in ipairs(c:GetChildren()) do
+                if v:IsA("Tool") and v.Name:lower():find(word) then n+=1 end
+            end
+        end
+        scan(LP.Backpack); if LP.Character then scan(LP.Character) end
+        return n
+    end
+
+    local preSm=countWord("small"); local preMd=countWord("medium"); local preLg=countWord("large")
+
+    if equipWithRetry("Empty Bag") then
+        jitter(); pressE()
+        task.wait(2) -- wait for bag to land in inventory
+    end
+
+    -- Check what changed by scanning for the words small/medium/large
+    local diffLg=countWord("large")-preLg
+    local diffMd=countWord("medium")-preMd
+    local diffSm=countWord("small")-preSm
+
+    local gotSize=nil
+    if diffLg>0 then gotSize="Large"
+    elseif diffMd>0 then gotSize="Medium"
+    elseif diffSm>0 then gotSize="Small" end
+
+    -- Last resort: just find any marshmallow tool and read name directly
+    if not gotSize then
+        local function scanAny(c) if not c then return end
+            for _,v in ipairs(c:GetChildren()) do
+                if v:IsA("Tool") then
+                    local n=v.Name:lower()
+                    if n:find("marshmallow") or n:find("marsh") then
+                        if n:find("large") then gotSize="Large"
+                        elseif n:find("medium") then gotSize="Medium"
+                        elseif n:find("small") then gotSize="Small" end
+                        stats.lastBatch=v.Name; return
+                    end
+                end
+            end
+        end
+        scanAny(LP.Backpack); if not gotSize and LP.Character then scanAny(LP.Character) end
+    end
+
+    if gotSize then
+        if gotSize=="Large" then stats.large+=1
+        elseif gotSize=="Medium" then stats.medium+=1
+        else stats.small+=1 end
+        logBatch(gotSize)
+        task.wait(0.5) -- wait for marshmallow to actually land in backpack
+        setStatus("✅ Got "..gotSize.." MS!")
+    else
+        setStatus("⚠ Collected (unknown size)")
+        stats.small+=1; logBatch("?")
+    end
+
+    stats.batches+=1
+    -- Track average cook time
+    if stats.cookStart then
+        stats.totalCookSecs += tick()-stats.cookStart
+        stats.cookCount += 1
+    end
+    stats.cookStart=nil
+
+    -- Discord webhook every N batches
+    if stats.batches%CFG.webhookBatches==0 then
+        sendWebhook("🍡 "..stats.batches.." batches done!")
+    end
+
+    return true
+end
+
+-- ── SELL ──────────────────────────────────────────────────────
+doSell = function()
+    local totalBefore=countMarshmallowInv()
+    if totalBefore==0 then setStatus("Nothing to sell"); return end
+    selling = true -- block watcher
+    directTP(SELLER_POS); task.wait(0.6)
+    local sold=0
+    local ms=getMarshmallows()
+    while #ms>0 do
+        local item=ms[1]
+        -- Determine size and price BEFORE selling
+        local itemName=item.Name
+        local sz=getSizeFromName(itemName)
+        local price=PRICES[sz] or PRICES.Small
+        -- Equip the item
+        local hum=LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if item.Parent~=LP.Character and hum then
+            pcall(function() hum:EquipTool(item) end)
+            task.wait(0.1)
+        end
+        if item.Parent~=LP.Character then
+            pcall(function() item.Parent=LP.Character end)
+            task.wait(0.1)
+        end
+        local countBefore=countMarshmallowInv()
+        pressE()
+        task.wait(0.35)
+        local countAfter=countMarshmallowInv()
+        -- Only credit if bag actually left inventory
+        if countAfter < countBefore then
+            stats.earned+=price
+            sold+=1
+        end
+        ms=getMarshmallows()
+        if not farmEnabled and sold>0 then break end
+    end
+    local actuallySold=totalBefore-countMarshmallowInv()
+    setStatus("sold "..actuallySold.." bag"..(actuallySold~=1 and "s" or ""))
+    unequipAll()
+    selling = false -- allow watcher again
+end
+
+-- ── BUY ───────────────────────────────────────────────────────
+local function buyByText(searchText)
+    for _=1,40 do
+        for _,v in ipairs(LP.PlayerGui:GetDescendants()) do
+            if v:IsA("TextButton") and v.Visible then
+                -- Match just the first line of the button text (e.g. "Gelatin" not "Gelatin\n$70")
+                local btnText = v.Text:split("\n")[1]:upper():gsub("%s+","")
+                local search  = searchText:upper():gsub("%s+","")
+                if btnText==search or v.Text:upper():find(search,1,true) then
+                    pcall(function() v.MouseButton1Click:Fire() end)
+                    pcall(function()
+                        local pos=v.AbsolutePosition+v.AbsoluteSize*0.5
+                        VIM:SendMouseButtonEvent(pos.X,pos.Y,0,true,game,1)
+                        task.wait(0.05)
+                        VIM:SendMouseButtonEvent(pos.X,pos.Y,0,false,game,1)
+                    end)
+                    unequipAll()
+                    return true
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+    return false
+end
+
+doBuy = function()
+    directTP(SELLER_POS); task.wait(1) -- wait for shop GUI to open on its own
+    setStatus("Buying supplies...")
+
+    if countInv("Water")==0 then
+        setStatus("Buying Water...")
+        buyByText("Water"); task.wait(0.5)
+    end
+    if countInv("Sugar Block Bag")==0 then
+        setStatus("Buying Sugar Block Bag...")
+        buyByText("Sugar Block Bag"); task.wait(0.5)
+    end
+    if countInv("Gelatin")==0 then
+        setStatus("Buying Gelatin...")
+        buyByText("Gelatin"); task.wait(0.5)
+    end
+
+    unequipAll()
+    setStatus("Bought — W:"..countInv("Water").." S:"..countInv("Sugar Block Bag").." G:"..countInv("Gelatin"))
+end
+
+-- ── WATCHDOG ──────────────────────────────────────────────────
+local function startWatchdog()
+    if watchThread then task.cancel(watchThread); watchThread=nil end
+    watchThread=task.spawn(function()
+        while farmEnabled do
+            task.wait(5)
+            if not farmEnabled then break end
+            local stuck=tick()-lastStatusChange
+            if stuck>CFG.watchdogSec then
+                setStatus("🔄 Watchdog restart!")
+                playErrorSound()
+                task.wait(1)
+                -- Cancel and restart farm
+                if farmThread then task.cancel(farmThread); farmThread=nil end
+                stats.cookStart=nil; stats.stepEnd=nil
+                lastStatusChange=tick()
+                farmThread=task.spawn(function()
+                    while farmEnabled do
+                        local ok=doCook()
+                        if not ok and farmEnabled then task.wait(2) end
+                        if loopEnabled and farmEnabled then
+                            doSell(); doBuy()
+                        end
+                        task.wait(0.3)
+                    end
+                    setStatus("Idle")
+                end)
+            end
+        end
+    end)
+end
+
+-- ── STOP ──────────────────────────────────────────────────────
+local function stopFarm()
+    if stats.farmStarted then
+        stats.farmUptime += tick()-stats.farmStarted
+        stats.farmStarted=nil
+    end
+    farmEnabled=false; loopEnabled=false
+    if farmThread  then task.cancel(farmThread);  farmThread=nil  end
+    if watchThread then task.cancel(watchThread); watchThread=nil end
+    stopMicroMove()
+    stats.cookStart=nil; stats.stepEnd=nil
+    setStatus("Idle")
+end
+
+-- ── START FARM (cook only) ────────────────────────────────────
+local function startFarm()
+    stopFarm(); farmEnabled=true
+    stats.farmStarted=tick()
+    setPromptSettings(100,false)
+    if CFG.autoUG then goUnderground() end
+    startMicroMove(); startWatchdog()
+    lastStatusChange=tick()
+    farmThread=task.spawn(function()
+        while farmEnabled do
+            local ok=doCook()
+            if not ok and farmEnabled then task.wait(2) end
+            task.wait(0.3)
+        end
+        setStatus("Idle"); stopMicroMove()
+    end)
+end
+
+-- ── START LOOP (cook → sell → buy → repeat) ──────────────────
+local function startLoop()
+    stopFarm(); farmEnabled=true; loopEnabled=true
+    stats.farmStarted=tick()
+    setPromptSettings(100,false)
+    if CFG.autoUG then goUnderground() end
+    startMicroMove(); startWatchdog()
+    lastStatusChange=tick()
+    farmThread=task.spawn(function()
+        -- Buy if missing ingredients
+        if countInv("Water")==0 or countInv("Sugar Block Bag")==0 or countInv("Gelatin")==0 then
+            doBuy()
+        end
+        while farmEnabled do
+            local ok=doCook()
+            if not farmEnabled then break end
+            if not ok then task.wait(2); doBuy()
+                if savedCookPos and farmEnabled then directTP(savedCookPos); task.wait(0.5) end
+                continue
+            end
+            doSell()
+            if not farmEnabled then break end
+            doBuy()
+            -- Return to cook spot after buying
+            if savedCookPos and farmEnabled then
+                setStatus("Returning to cook spot...")
+                directTP(savedCookPos); task.wait(0.5)
+            end
+            task.wait(0.3)
+        end
+        setStatus("Idle"); stopMicroMove()
+    end)
+end
+
+-- Death recovery
+LP.CharacterAdded:Connect(function(char)
+    if ugPlatform then ugPlatform:Destroy(); ugPlatform=nil end; isUG=false
+    if antiDeath then
+        task.wait(0.5)
+        local hum=char:FindFirstChildOfClass("Humanoid")
+        if hum then pcall(function() hum.MaxHealth=math.huge; hum.Health=math.huge end) end
+    end
+    -- If farm was running, wait for character to load then continue
+    if farmEnabled then
+        task.wait(2)
+        setPromptSettings(100,false)
+        if CFG.autoUG then goUnderground() end
+        setStatus("Recovered from death — resuming")
+    end
+end)
+
+UIS.InputBegan:Connect(function(inp,gpe)
+    if gpe then return end
+    if ctrlDelete and inp.KeyCode==Enum.KeyCode.Delete and UIS:IsKeyDown(Enum.KeyCode.LeftControl) then
+        stopFarm(); SG:Destroy()
+    end
+end)
+
+
+-- ── GUI ───────────────────────────────────────────────────────
+local WIN_W = 280
+
+-- Theme
+local C = {
+    bg      = Color3.fromRGB(13,13,15),
+    surf    = Color3.fromRGB(19,19,22),
+    card    = Color3.fromRGB(24,24,28),
+    border  = Color3.fromRGB(38,38,44),
+    acc     = Color3.fromRGB(190,140,20),
+    accDim  = Color3.fromRGB(100,72,8),
+    txt     = Color3.fromRGB(205,205,210),
+    sub     = Color3.fromRGB(110,110,118),
+    mute    = Color3.fromRGB(58,58,65),
+    green   = Color3.fromRGB(46,180,82),
+    red     = Color3.fromRGB(185,32,32),
+    blue    = Color3.fromRGB(60,120,210),
+    yellow  = Color3.fromRGB(230,190,50),
+    orange  = Color3.fromRGB(200,100,20),
+    white   = Color3.new(1,1,1),
+}
+
+-- ── HELPERS ───────────────────────────────────────────────────
+local function frame(parent,props)
+    local f=Instance.new("Frame",parent)
+    for k,v in pairs(props) do pcall(function() f[k]=v end) end
+    return f
+end
+
+local function lbl(parent,props)
+    local l=Instance.new("TextLabel",parent)
+    l.Font=Enum.Font.Code; l.BackgroundTransparency=1
+    l.TextXAlignment=Enum.TextXAlignment.Left
+    for k,v in pairs(props) do pcall(function() l[k]=v end) end
+    return l
+end
+
+local function btn(parent,props,onClick)
+    local b=Instance.new("TextButton",parent)
+    b.Font=Enum.Font.Code; b.AutoButtonColor=false
+    b.BorderSizePixel=0; b.TextXAlignment=Enum.TextXAlignment.Center
+    for k,v in pairs(props) do pcall(function() b[k]=v end) end
+    if onClick then b.MouseButton1Click:Connect(onClick) end
+    return b
+end
+
+local function addPad(parent,l,r,t,bo)
+    local p=Instance.new("UIPadding",parent)
+    p.PaddingLeft=UDim.new(0,l or 0); p.PaddingRight=UDim.new(0,r or 0)
+    p.PaddingTop=UDim.new(0,t or 0); p.PaddingBottom=UDim.new(0,bo or 0)
+end
+
+local function addList(parent,pad,dir)
+    local l=Instance.new("UIListLayout",parent)
+    l.SortOrder=Enum.SortOrder.LayoutOrder
+    l.Padding=UDim.new(0,pad or 0)
+    l.FillDirection=dir or Enum.FillDirection.Vertical
+    return l
+end
+
+local function corner(parent,r)
+    Instance.new("UICorner",parent).CornerRadius=UDim.new(0,r or 4)
+end
+
+local function divider(parent,order)
+    local d=frame(parent,{
+        Size=UDim2.new(1,0,0,1),
+        BackgroundColor3=C.border,
+        BorderSizePixel=0,
+        LayoutOrder=order
+    })
+    return d
+end
+
+-- Section header
+local function sectionHeader(parent,text,order)
+    local f=frame(parent,{
+        Size=UDim2.new(1,0,0,18),
+        BackgroundTransparency=1,
+        LayoutOrder=order
+    })
+    lbl(f,{
+        Text=text:upper(),
+        TextSize=9,
+        TextColor3=C.sub,
+        Size=UDim2.new(1,-8,1,0),
+        Position=UDim2.new(0,8,0,0),
+    })
+    -- accent line
+    frame(f,{
+        Size=UDim2.new(1,0,0,1),
+        Position=UDim2.new(0,0,1,-1),
+        BackgroundColor3=C.mute,
+        BorderSizePixel=0,
+    })
+    return f
+end
+
+-- Card container
+local function card(parent,order)
+    local f=frame(parent,{
+        Size=UDim2.new(1,0,0,0),
+        AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundColor3=C.card,
+        BorderSizePixel=1,
+        BorderColor3=C.border,
+        LayoutOrder=order,
+    })
+    corner(f,6)
+    return f
+end
+
+-- Stat row inside a card: "label" left, "value" right
+local statLabels = {}
+local function statRow(parent,key,labelText,valText,valCol,order)
+    local row=frame(parent,{
+        Size=UDim2.new(1,0,0,18),
+        BackgroundTransparency=1,
+        LayoutOrder=order,
+    })
+    lbl(row,{
+        Text=labelText,
+        TextSize=10,
+        TextColor3=C.sub,
+        Size=UDim2.new(0.52,0,1,0),
+        Position=UDim2.new(0,10,0,0),
+    })
+    local v=lbl(row,{
+        Text=valText or "--",
+        TextSize=10,
+        TextColor3=valCol or C.txt,
+        Size=UDim2.new(0.48,-10,1,0),
+        Position=UDim2.new(0.52,0,0,0),
+        TextXAlignment=Enum.TextXAlignment.Right,
+    })
+    if key then statLabels[key]=v end
+    return row
+end
+
+-- Mini stat tile (2-col grid)
+local miniStatLabels={}
+local function miniStat(parent,key,labelText,valText,valCol)
+    local f=frame(parent,{
+        Size=UDim2.new(0.5,-2,0,44),
+        BackgroundColor3=C.surf,
+        BorderSizePixel=1,
+        BorderColor3=C.border,
+    })
+    corner(f,5)
+    lbl(f,{
+        Text=valText or "0",
+        TextSize=16,
+        TextColor3=valCol or C.txt,
+        Font=Enum.Font.Code,
+        Size=UDim2.new(1,0,0,24),
+        Position=UDim2.new(0,0,0,6),
+        TextXAlignment=Enum.TextXAlignment.Center,
+    })
+    lbl(f,{
+        Text=labelText,
+        TextSize=9,
+        TextColor3=C.sub,
+        Size=UDim2.new(1,0,0,14),
+        Position=UDim2.new(0,0,1,-16),
+        TextXAlignment=Enum.TextXAlignment.Center,
+    })
+    if key then miniStatLabels[key]=f:FindFirstChildOfClass("TextLabel") end
+    return f
+end
+
+-- Progress bar
+local function progressBar(parent,order)
+    local wrap=frame(parent,{
+        Size=UDim2.new(1,0,0,22),
+        BackgroundColor3=C.surf,
+        BorderSizePixel=1,
+        BorderColor3=C.border,
+        LayoutOrder=order,
+    })
+    corner(wrap,4)
+    addPad(wrap,8,8,0,0)
+    local track=frame(wrap,{
+        Size=UDim2.new(1,0,0,4),
+        Position=UDim2.new(0,0,0.5,-2),
+        BackgroundColor3=C.mute,
+        BorderSizePixel=0,
+    })
+    corner(track,2)
+    local fill=frame(track,{
+        Size=UDim2.new(0,0,1,0),
+        BackgroundColor3=C.acc,
+        BorderSizePixel=0,
+    })
+    corner(fill,2)
+    local timerLbl=lbl(wrap,{
+        Text="--",
+        TextSize=9,
+        TextColor3=C.acc,
+        Size=UDim2.new(0.5,0,1,0),
+        Position=UDim2.new(0,0,0,0),
+    })
+    local pctLbl=lbl(wrap,{
+        Text="",
+        TextSize=9,
+        TextColor3=C.sub,
+        Size=UDim2.new(0.5,0,1,0),
+        Position=UDim2.new(0.5,0,0,0),
+        TextXAlignment=Enum.TextXAlignment.Right,
+    })
+    return wrap, fill, timerLbl, pctLbl
+end
+
+-- Toggle button
+local function toggle(parent,label,onCol,order,onChange)
+    local state=false
+    local offcol=C.mute
+    local b=frame(parent,{
+        Size=UDim2.new(1,0,0,28),
+        BackgroundColor3=C.surf,
+        BorderSizePixel=1,
+        BorderColor3=C.border,
+        LayoutOrder=order,
+    })
+    corner(b,5)
+    -- label text
+    lbl(b,{
+        Text=label,
+        TextSize=11,
+        TextColor3=C.txt,
+        Size=UDim2.new(1,-50,1,0),
+        Position=UDim2.new(0,10,0,0),
+    })
+    -- pill
+    local pill=frame(b,{
+        Size=UDim2.new(0,36,0,16),
+        Position=UDim2.new(1,-44,0.5,-8),
+        BackgroundColor3=offcol,
+        BorderSizePixel=0,
+    })
+    corner(pill,8)
+    local knob=frame(pill,{
+        Size=UDim2.new(0,12,0,12),
+        Position=UDim2.new(0,2,0.5,-6),
+        BackgroundColor3=C.white,
+        BorderSizePixel=0,
+    })
+    corner(knob,6)
+    local pillLbl=lbl(pill,{
+        Text="off",
+        TextSize=8,
+        TextColor3=C.sub,
+        Size=UDim2.new(1,-16,1,0),
+        Position=UDim2.new(0,16,0,0),
+        TextXAlignment=Enum.TextXAlignment.Center,
+    })
+    -- clickable overlay
+    local clickBtn=Instance.new("TextButton",b)
+    clickBtn.Size=UDim2.new(1,0,1,0); clickBtn.BackgroundTransparency=1
+    clickBtn.Text=""; clickBtn.BorderSizePixel=0; clickBtn.ZIndex=2
+    clickBtn.MouseButton1Click:Connect(function()
+        state=not state
+        pill.BackgroundColor3=state and onCol or offcol
+        knob.Position=state and UDim2.new(1,-14,0.5,-6) or UDim2.new(0,2,0.5,-6)
+        pillLbl.Text=state and "on" or "off"
+        pillLbl.TextColor3=state and C.white or C.sub
+        pillLbl.Position=state and UDim2.new(0,2,0,0) or UDim2.new(0,16,0,0)
+        b.BorderColor3=state and onCol or C.border
+        onChange(state)
+    end)
+    return b, function() return state end
+end
+
+-- Action button
+local function actionBtn(parent,text,col,order,onClick)
+    local b=btn(parent,{
+        Text=text,
+        TextSize=11,
+        TextColor3=C.white,
+        BackgroundColor3=col,
+        Size=UDim2.new(1,0,0,28),
+        BorderSizePixel=0,
+        LayoutOrder=order,
+    },onClick)
+    corner(b,5)
+    b.MouseEnter:Connect(function()
+        b.BackgroundColor3=Color3.fromRGB(
+            math.min(255,math.floor(col.R*255)+20),
+            math.min(255,math.floor(col.G*255)+20),
+            math.min(255,math.floor(col.B*255)+20))
+    end)
+    b.MouseLeave:Connect(function() b.BackgroundColor3=col end)
+    return b
+end
+
+-- Slider row
+local sliderValues={}
+local function sliderRow(parent,labelText,key,min,max,default,order)
+    local f=frame(parent,{
+        Size=UDim2.new(1,0,0,42),
+        BackgroundColor3=C.surf,
+        BorderSizePixel=1,
+        BorderColor3=C.border,
+        LayoutOrder=order,
+    })
+    corner(f,5)
+    lbl(f,{
+        Text=labelText,
+        TextSize=10,
+        TextColor3=C.txt,
+        Size=UDim2.new(0.6,0,0,16),
+        Position=UDim2.new(0,10,0,4),
+    })
+    local valLbl=lbl(f,{
+        Text=tostring(default),
+        TextSize=10,
+        TextColor3=C.acc,
+        Size=UDim2.new(0.4,-10,0,16),
+        Position=UDim2.new(0.6,0,0,4),
+        TextXAlignment=Enum.TextXAlignment.Right,
+    })
+    local track=frame(f,{
+        Size=UDim2.new(1,-20,0,4),
+        Position=UDim2.new(0,10,0,26),
+        BackgroundColor3=C.mute,
+        BorderSizePixel=0,
+    })
+    corner(track,2)
+    local fill=frame(track,{
+        Size=UDim2.new((default-min)/(max-min),0,1,0),
+        BackgroundColor3=C.acc,
+        BorderSizePixel=0,
+    })
+    corner(fill,2)
+    local thumb=frame(track,{
+        Size=UDim2.new(0,12,0,12),
+        Position=UDim2.new((default-min)/(max-min),0,0.5,-6),
+        BackgroundColor3=C.white,
+        BorderSizePixel=0,
+        ZIndex=2,
+    })
+    corner(thumb,6)
+    -- drag
+    local sliding=false
+    local function update(x)
+        local pct=math.clamp((x-track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
+        local val=math.floor(min+(max-min)*pct*10+0.5)/10
+        fill.Size=UDim2.new(pct,0,1,0)
+        thumb.Position=UDim2.new(pct,-6,0.5,-6)
+        valLbl.Text=tostring(val)
+        sliderValues[key]=val
+        if CFG[key]~=nil then CFG[key]=val end
+    end
+    track.InputBegan:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.MouseButton1 then sliding=true; update(inp.Position.X) end
+    end)
+    track.InputEnded:Connect(function(inp)
+        if inp.UserInputType==Enum.UserInputType.MouseButton1 then sliding=false end
+    end)
+    UIS.InputChanged:Connect(function(inp)
+        if sliding and inp.UserInputType==Enum.UserInputType.MouseMovement then update(inp.Position.X) end
+    end)
+    sliderValues[key]=default
+    return f
+end
+
+-- ── WINDOW ────────────────────────────────────────────────────
+local Main=frame(SG,{
+    Name="Main", Active=true,
+    Size=UDim2.new(0,WIN_W,0,560),
+    Position=UDim2.new(0.5,-WIN_W/2,0.5,-280),
+    BackgroundColor3=C.bg,
+    BorderSizePixel=1,
+    BorderColor3=C.border,
+    ClipsDescendants=true,
+})
+corner(Main,6)
+
+-- drag
+RunService.RenderStepped:Connect(function()
+    if not Dragging then return end
+    local mp=UIS:GetMouseLocation(); local vp=Cam.ViewportSize
+    Main.Position=UDim2.new(0,math.clamp(mp.X-DragOff.X,0,vp.X-WIN_W),0,math.clamp(mp.Y-DragOff.Y,0,vp.Y-80))
+end)
+
+-- ── TITLE BAR ─────────────────────────────────────────────────
+local titleBar=frame(Main,{
+    Size=UDim2.new(1,0,0,32),
+    BackgroundColor3=C.surf,
+    BorderSizePixel=0,
+})
+-- gold accent strip under title
+frame(titleBar,{
+    Size=UDim2.new(1,0,0,1),
+    Position=UDim2.new(0,0,1,-1),
+    BackgroundColor3=C.acc,
+    BorderSizePixel=0,
+})
+lbl(titleBar,{
+    Text="c3  automs",
+    TextSize=13,
+    TextColor3=C.acc,
+    Font=Enum.Font.Code,
+    Size=UDim2.new(1,-70,1,0),
+    Position=UDim2.new(0,12,0,0),
+})
+-- status badge in title
+local titleBadge=frame(titleBar,{
+    Size=UDim2.new(0,50,0,18),
+    Position=UDim2.new(1,-108,0.5,-9),
+    BackgroundColor3=C.mute,
+    BorderSizePixel=0,
+})
+corner(titleBadge,4)
+local titleBadgeLbl=lbl(titleBadge,{
+    Text="idle",
+    TextSize=9,
+    TextColor3=C.sub,
+    Size=UDim2.new(1,0,1,0),
+    TextXAlignment=Enum.TextXAlignment.Center,
+})
+-- minimize
+local minBtn=btn(titleBar,{
+    Text="─", TextSize=11, TextColor3=C.sub,
+    BackgroundColor3=C.mute,
+    Size=UDim2.new(0,22,0,22),
+    Position=UDim2.new(1,-48,0.5,-11),
+})
+corner(minBtn,4)
+-- close
+local xBtn=btn(titleBar,{
+    Text="✕", TextSize=10, TextColor3=C.white,
+    BackgroundColor3=C.red,
+    Size=UDim2.new(0,22,0,22),
+    Position=UDim2.new(1,-24,0.5,-11),
+},function() stopFarm(); SG:Destroy() end)
+corner(xBtn,4)
+
+titleBar.InputBegan:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 then
+        Dragging=true; DragOff=Vector2.new(inp.Position.X-Main.AbsolutePosition.X,inp.Position.Y-Main.AbsolutePosition.Y)
+    end
+end)
+titleBar.InputEnded:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 then Dragging=false end
+end)
+
+local minimized=false
+minBtn.MouseButton1Click:Connect(function()
+    minimized=not minimized
+    minBtn.Text=minimized and "▪" or "─"
+    Main.Size=minimized and UDim2.new(0,WIN_W,0,32) or UDim2.new(0,WIN_W,0,560)
+end)
+
+-- ── TAB STRIP ─────────────────────────────────────────────────
+local tabBar=frame(Main,{
+    Size=UDim2.new(1,0,0,30),
+    Position=UDim2.new(0,0,0,32),
+    BackgroundColor3=C.bg,
+    BorderSizePixel=0,
+})
+addList(tabBar,0,Enum.FillDirection.Horizontal)
+
+local pages={}; local tabBtns={}; local activeTab=""
+
+local function switchTab(name)
+    activeTab=name
+    for n,tb in pairs(tabBtns) do
+        local active=n==name
+        tb.BackgroundColor3=active and C.surf or C.bg
+        tb.TextColor3=active and C.acc or C.sub
+        -- bottom indicator
+        local ind=tb:FindFirstChild("ind")
+        if ind then ind.BackgroundTransparency=active and 0 or 1 end
+    end
+    for n,p in pairs(pages) do p.Visible=n==name end
+end
+
+local tabDefs={
+    {n="farm",label="farm"},
+    {n="cfg", label="cfg"},
+    {n="hook",label="hook"},
+    {n="rec", label="rec"},
+}
+for _,td in ipairs(tabDefs) do
+    local tb=btn(tabBar,{
+        Text=td.label, TextSize=10, Font=Enum.Font.Code,
+        TextColor3=C.sub,
+        BackgroundColor3=C.bg,
+        Size=UDim2.new(1/#tabDefs,0,1,0),
+        BorderSizePixel=0,
+    })
+    -- bottom accent indicator
+    local ind=frame(tb,{Name="ind",
+        Size=UDim2.new(1,0,0,2),
+        Position=UDim2.new(0,0,1,-2),
+        BackgroundColor3=C.acc,
+        BorderSizePixel=0,
+        BackgroundTransparency=1,
+    })
+    tb.MouseButton1Click:Connect(function() switchTab(td.n) end)
+    tabBtns[td.n]=tb
+end
+
+-- bottom strip border
+frame(tabBar,{
+    Size=UDim2.new(1,0,0,1),
+    Position=UDim2.new(0,0,1,-1),
+    BackgroundColor3=C.border,
+    BorderSizePixel=0,
+})
+
+-- ── PAGES ─────────────────────────────────────────────────────
+local pageContainer=frame(Main,{
+    Size=UDim2.new(1,0,1,-62),
+    Position=UDim2.new(0,0,0,62),
+    BackgroundTransparency=1,
+    BorderSizePixel=0,
+    ClipsDescendants=true,
+})
+
+local function makePage(name)
+    local p=Instance.new("ScrollingFrame",pageContainer)
+    p.Name=name; p.Visible=false
+    p.Size=UDim2.new(1,0,1,0)
+    p.BackgroundTransparency=1; p.BorderSizePixel=0
+    p.ScrollBarThickness=3; p.ScrollBarImageColor3=C.border
+    p.CanvasSize=UDim2.new(0,0,0,0)
+    local l=addList(p,6)
+    l:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        p.CanvasSize=UDim2.new(0,0,0,l.AbsoluteContentSize.Y+10)
+    end)
+    addPad(p,8,8,8,8)
+    pages[name]=p; return p
+end
+
+local FARM_PAGE   = makePage("farm")
+local CFG_PAGE    = makePage("cfg")
+local HOOK_PAGE   = makePage("hook")
+local REC_PAGE    = makePage("rec")
+
+-- ══════════════════════════════════════════════════════════════
+-- FARM PAGE
+-- ══════════════════════════════════════════════════════════════
+
+-- ── STATUS CARD ───────────────────────────────────────────────
+local statusCard=card(FARM_PAGE,1)
+addPad(statusCard,0,0,8,8)
+local statusCardList=addList(statusCard,2)
+
+local lStatus_main=lbl(statusCard,{
+    Text="idle",
+    TextSize=12,
+    TextColor3=C.acc,
+    Font=Enum.Font.Code,
+    Size=UDim2.new(1,-16,0,20),
+    Position=UDim2.new(0,8,0,8),
+    LayoutOrder=1,
+})
+
+-- step timer bar inside status card
+local stepWrap=frame(statusCard,{
+    Size=UDim2.new(1,-16,0,16),
+    BackgroundTransparency=1,
+    LayoutOrder=2,
+})
+local stepBar=frame(stepWrap,{
+    Size=UDim2.new(1,0,0,4),
+    Position=UDim2.new(0,0,0,0),
+    BackgroundColor3=C.mute,
+    BorderSizePixel=0,
+})
+corner(stepBar,2)
+local stepFill=frame(stepBar,{
+    Size=UDim2.new(0,0,1,0),
+    BackgroundColor3=C.acc,
+    BorderSizePixel=0,
+})
+corner(stepFill,2)
+local stepLbl=lbl(stepWrap,{
+    Text="step: --",
+    TextSize=9,
+    TextColor3=C.sub,
+    Size=UDim2.new(0.5,0,0,12),
+    Position=UDim2.new(0,0,0,6),
+})
+local stepPct=lbl(stepWrap,{
+    Text="",
+    TextSize=9,
+    TextColor3=C.acc,
+    Size=UDim2.new(0.5,0,0,12),
+    Position=UDim2.new(0.5,0,0,6),
+    TextXAlignment=Enum.TextXAlignment.Right,
+})
+
+-- ── MINI STAT GRID ────────────────────────────────────────────
+local miniGrid=frame(FARM_PAGE,{
+    Size=UDim2.new(1,0,0,96),
+    BackgroundTransparency=1,
+    LayoutOrder=2,
+})
+local miniGridLayout=Instance.new("UIGridLayout",miniGrid)
+miniGridLayout.CellSize=UDim2.new(0.5,-3,0,44)
+miniGridLayout.CellPadding=UDim2.new(0,4,0,4)
+miniGridLayout.SortOrder=Enum.SortOrder.LayoutOrder
+
+miniStat(miniGrid,"batches","batches","0",C.acc)
+miniStat(miniGrid,"earned","earned","$0",C.green)
+miniStat(miniGrid,"inbag","in bag","0",C.yellow)
+miniStat(miniGrid,"failed","failed","0",C.red)
+
+-- ── COOK TIMERS ───────────────────────────────────────────────
+sectionHeader(FARM_PAGE,"cook",3)
+local timerCard=card(FARM_PAGE,4)
+addPad(timerCard,0,0,4,4)
+addList(timerCard,0)
+local lCookTime = statRow(timerCard,"cooktime","cook time","--",C.yellow,1)
+local lAvgCook  = statRow(timerCard,"avgcook","avg cook","--",C.sub,2)
+local lUptime   = statRow(timerCard,"uptime","uptime","0:00",C.sub,3)
+local lSmall    = statRow(timerCard,"small","small",  "0",C.green,4)
+local lMedium   = statRow(timerCard,"medium","medium", "0",C.green,5)
+local lLarge    = statRow(timerCard,"large","large",   "0",C.green,6)
+
+-- ── INVENTORY ─────────────────────────────────────────────────
+sectionHeader(FARM_PAGE,"inventory",5)
+local invCard=card(FARM_PAGE,6)
+addPad(invCard,8,8,8,8)
+local invGrid=frame(invCard,{
+    Size=UDim2.new(1,0,0,40),
+    BackgroundTransparency=1,
+})
+local invGridLayout=Instance.new("UIGridLayout",invGrid)
+invGridLayout.CellSize=UDim2.new(0.333,-4,0,40)
+invGridLayout.CellPadding=UDim2.new(0,4,0,0)
+invGridLayout.SortOrder=Enum.SortOrder.LayoutOrder
+
+local function invPill(parent,key,label,order)
+    local f=frame(parent,{BackgroundColor3=C.surf,BorderSizePixel=1,BorderColor3=C.border,LayoutOrder=order})
+    corner(f,5)
+    lbl(f,{
+        Text=label,
+        TextSize=8,TextColor3=C.sub,
+        Size=UDim2.new(1,0,0,12),Position=UDim2.new(0,0,0,3),
+        TextXAlignment=Enum.TextXAlignment.Center,
+    })
+    local lcount=lbl(f,{
+        Text="0",
+        TextSize=12,TextColor3=C.red,Font=Enum.Font.Code,
+        Size=UDim2.new(1,0,0,16),Position=UDim2.new(0,0,0,15),
+        TextXAlignment=Enum.TextXAlignment.Center,
+    })
+    miniStatLabels["inv_"..key]=lcount
+    return f
+end
+invPill(invGrid,"w","water",1)
+invPill(invGrid,"s","sugar",2)
+invPill(invGrid,"g","gelatin",3)
+
+-- ── LOG ───────────────────────────────────────────────────────
+sectionHeader(FARM_PAGE,"log",7)
+local logCard=card(FARM_PAGE,8)
+addPad(logCard,0,0,4,4)
+addList(logCard,1)
+local logLabels={}
+for i=1,4 do
+    local l=lbl(logCard,{
+        Text="",
+        TextSize=9,
+        TextColor3= i==1 and C.acc or C.sub,
+        Size=UDim2.new(1,0,0,13),
+        LayoutOrder=i,
+    })
+    addPad(l,8,8,0,0)
+    logLabels[i]=l
+end
+
+local logHistory={}
+local function pushLog(msg)
+    table.insert(logHistory,1,msg)
+    if #logHistory>4 then table.remove(logHistory) end
+    for i,l in ipairs(logLabels) do
+        l.Text=logHistory[i] or ""
+        l.TextColor3=i==1 and C.acc or C.sub
+    end
+end
+
+-- ── TOGGLES ───────────────────────────────────────────────────
+sectionHeader(FARM_PAGE,"options",9)
+
+local antiAFKToggle,_=toggle(FARM_PAGE,"anti afk",C.green,10,function(v)
+    antiAFK=v
+    if v then
+        if afkThread then task.cancel(afkThread) end
+        afkThread=task.spawn(function()
+            while antiAFK do
+                task.wait(60)
+                if not antiAFK then break end
+                VIM:SendKeyEvent(true,Enum.KeyCode.Space,false,game); task.wait(0.1)
+                VIM:SendKeyEvent(false,Enum.KeyCode.Space,false,game)
+            end
+        end)
+    else if afkThread then task.cancel(afkThread); afkThread=nil end end
+end)
+
+local ctrlDeleteToggle,_=toggle(FARM_PAGE,"ctrl+delete to close",C.green,11,function(v) ctrlDelete=v end)
+local antiDeathToggle,_=toggle(FARM_PAGE,"anti death",C.green,12,function(v)
+    antiDeath=v
+    if v and LP.Character then
+        local hum=LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then pcall(function() hum.MaxHealth=math.huge; hum.Health=math.huge end) end
+    end
+end)
+local jitterToggle,_=toggle(FARM_PAGE,"jitter (anti-detect)",C.green,13,function(v) CFG.jitter=v end)
+
+-- ── ACTIONS ───────────────────────────────────────────────────
+sectionHeader(FARM_PAGE,"actions",14)
+
+actionBtn(FARM_PAGE,"sell all now",C.blue,15,function()
+    if not selling then task.spawn(doSell) end
+end)
+actionBtn(FARM_PAGE,"buy water",Color3.fromRGB(30,80,170),16,function()
+    task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Water") end)
+end)
+actionBtn(FARM_PAGE,"buy sugar block bag",Color3.fromRGB(120,65,0),17,function()
+    task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Sugar Block Bag") end)
+end)
+actionBtn(FARM_PAGE,"buy gelatin",Color3.fromRGB(80,0,140),18,function()
+    task.spawn(function() directTP(SELLER_POS); task.wait(0.8); clickButton("Gelatin") end)
+end)
+actionBtn(FARM_PAGE,"tp → seller",Color3.fromRGB(20,80,40),19,function() directTP(SELLER_POS) end)
+actionBtn(FARM_PAGE,"tp → apartment",Color3.fromRGB(0,70,80),20,function() directTP(Vector3.new(1009,10,216)) end)
+actionBtn(FARM_PAGE,"save cook spot",C.mute,21,function()
+    local c=LP.Character; local r=c and c:FindFirstChild("HumanoidRootPart")
+    if r then savedCookPos=r.Position
+        pushLog("saved cook spot "..math.floor(r.Position.X)..","..math.floor(r.Position.Y)..","..math.floor(r.Position.Z))
+    end
+end)
+actionBtn(FARM_PAGE,"return to cook spot",C.mute,22,function()
+    if savedCookPos then directTP(savedCookPos) end
+end)
+actionBtn(FARM_PAGE,"reset stats",C.mute,23,function()
+    stats.batches=0; stats.small=0; stats.medium=0; stats.large=0
+    stats.earned=0; stats.spent=0; stats.failed=0
+    stats.farmUptime=0; stats.farmStarted=farmEnabled and tick() or nil
+    pushLog("stats reset")
+end)
+
+-- ── BOTTOM BUTTONS ────────────────────────────────────────────
+local bottomBar=frame(FARM_PAGE,{
+    Size=UDim2.new(1,0,0,64),
+    BackgroundTransparency=1,
+    LayoutOrder=99,
+})
+local bbList=addList(bottomBar,4)
+
+local startStopBtn=btn(bottomBar,{
+    Text="start farm",
+    TextSize=12, Font=Enum.Font.Code,
+    TextColor3=C.white,
+    BackgroundColor3=C.green,
+    Size=UDim2.new(1,0,0,30),
+    BorderSizePixel=0,
+    LayoutOrder=1,
+},nil)
+corner(startStopBtn,5)
+
+local loopBtn=btn(bottomBar,{
+    Text="start loop",
+    TextSize=11, Font=Enum.Font.Code,
+    TextColor3=C.white,
+    BackgroundColor3=Color3.fromRGB(30,60,130),
+    Size=UDim2.new(1,0,0,26),
+    BorderSizePixel=0,
+    LayoutOrder=2,
+},nil)
+corner(loopBtn,5)
+
+startStopBtn.MouseButton1Click:Connect(function()
+    if farmEnabled and not loopEnabled then
+        stopFarm()
+        startStopBtn.Text="start farm"; startStopBtn.BackgroundColor3=C.green
+        titleBadgeLbl.Text="idle"; titleBadge.BackgroundColor3=C.mute
+    else
+        startFarm()
+        startStopBtn.Text="stop farm"; startStopBtn.BackgroundColor3=C.red
+        loopBtn.Text="start loop"; loopBtn.BackgroundColor3=Color3.fromRGB(30,60,130)
+        titleBadgeLbl.Text="farming"; titleBadge.BackgroundColor3=Color3.fromRGB(20,80,30)
+        titleBadgeLbl.TextColor3=C.green
+    end
+end)
+
+loopBtn.MouseButton1Click:Connect(function()
+    if loopEnabled then
+        stopFarm()
+        loopBtn.Text="start loop"; loopBtn.BackgroundColor3=Color3.fromRGB(30,60,130)
+        startStopBtn.Text="start farm"; startStopBtn.BackgroundColor3=C.green
+        titleBadgeLbl.Text="idle"; titleBadge.BackgroundColor3=C.mute
+    else
+        startLoop()
+        loopBtn.Text="stop loop"; loopBtn.BackgroundColor3=C.red
+        startStopBtn.Text="start farm"; startStopBtn.BackgroundColor3=C.green
+        titleBadgeLbl.Text="looping"; titleBadge.BackgroundColor3=Color3.fromRGB(20,40,100)
+        titleBadgeLbl.TextColor3=C.blue
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- CONFIG PAGE
+-- ══════════════════════════════════════════════════════════════
+sectionHeader(CFG_PAGE,"cook timings",1)
+sliderRow(CFG_PAGE,"water wait (s)","waterWait",5,40,22,2)
+sliderRow(CFG_PAGE,"sugar wait (s)","sugarWait",0.5,10,2.5,3)
+sliderRow(CFG_PAGE,"gelatin wait (s)","gelatinWait",20,60,47,4)
+sliderRow(CFG_PAGE,"watchdog (s)","watchdogSec",30,300,90,5)
+
+sectionHeader(CFG_PAGE,"prices",6)
+local function priceRow(parent,label,key,order)
+    local f=frame(parent,{
+        Size=UDim2.new(1,0,0,30),
+        BackgroundColor3=C.surf,
+        BorderSizePixel=1, BorderColor3=C.border,
+        LayoutOrder=order,
+    })
+    corner(f,5)
+    lbl(f,{
+        Text=label, TextSize=10, TextColor3=C.txt,
+        Size=UDim2.new(0.55,0,1,0), Position=UDim2.new(0,10,0,0),
+    })
+    local vl=lbl(f,{
+        Text="$"..PRICES[key], TextSize=10, TextColor3=C.acc,
+        Size=UDim2.new(0.25,0,1,0), Position=UDim2.new(0.55,0,0,0),
+        TextXAlignment=Enum.TextXAlignment.Center,
+    })
+    local mb=btn(f,{Text="-",TextSize=12,TextColor3=C.white,BackgroundColor3=C.mute,
+        Size=UDim2.new(0,22,0,22),Position=UDim2.new(1,-48,0.5,-11)},nil)
+    corner(mb,4)
+    local ab=btn(f,{Text="+",TextSize=12,TextColor3=C.white,BackgroundColor3=C.mute,
+        Size=UDim2.new(0,22,0,22),Position=UDim2.new(1,-24,0.5,-11)},nil)
+    corner(ab,4)
+    mb.MouseButton1Click:Connect(function() PRICES[key]=math.max(0,PRICES[key]-10); vl.Text="$"..PRICES[key] end)
+    ab.MouseButton1Click:Connect(function() PRICES[key]=PRICES[key]+10; vl.Text="$"..PRICES[key] end)
+end
+priceRow(CFG_PAGE,"small bag","Small",7)
+priceRow(CFG_PAGE,"medium bag","Medium",8)
+priceRow(CFG_PAGE,"large bag","Large",9)
+
+sectionHeader(CFG_PAGE,"options",10)
+toggle(CFG_PAGE,"jitter (random delays)",C.green,11,function(v) CFG.jitter=v end)
+toggle(CFG_PAGE,"micro movements",C.green,12,function(v) CFG.microMove=v end)
+toggle(CFG_PAGE,"auto underground",C.green,13,function(v) CFG.autoUG=v end)
+
+-- ══════════════════════════════════════════════════════════════
+-- WEBHOOK PAGE
+-- ══════════════════════════════════════════════════════════════
+sectionHeader(HOOK_PAGE,"discord webhook",1)
+local whCard=card(HOOK_PAGE,2)
+addPad(whCard,8,8,8,8)
+local whBox=Instance.new("TextBox",whCard)
+whBox.Size=UDim2.new(1,0,0,28); whBox.Font=Enum.Font.Code; whBox.TextSize=9
+whBox.Text=""; whBox.PlaceholderText="https://discord.com/api/webhooks/..."
+whBox.TextColor3=C.txt; whBox.PlaceholderColor3=C.sub
+whBox.BackgroundColor3=C.bg; whBox.BorderSizePixel=1
+whBox.ClearTextOnFocus=false; whBox.TextXAlignment=Enum.TextXAlignment.Left
+corner(whBox,4)
+addPad(whBox,6,6,0,0)
+whBox:GetPropertyChangedSignal("Text"):Connect(function() WEBHOOK_URL=whBox.Text end)
+
+sectionHeader(HOOK_PAGE,"settings",3)
+sliderRow(HOOK_PAGE,"every N batches","webhookBatches",1,50,5,4)
+actionBtn(HOOK_PAGE,"test webhook",C.blue,5,function()
+    if WEBHOOK_URL=="" then pushLog("⚠ no webhook url set"); return end
+    sendWebhook("✅ test from c3 automs — working!")
+end)
+actionBtn(HOOK_PAGE,"send stats now",C.mute,6,function() sendWebhook("📊 manual stats report") end)
+
+-- ══════════════════════════════════════════════════════════════
+-- RECORDER PAGE
+-- ══════════════════════════════════════════════════════════════
+local RECORDER_PAGE = REC_PAGE
+sectionHeader(REC_PAGE,"recorder",1)
+
+local WATCH_KEYS = {
+    Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+    Enum.KeyCode.Space, Enum.KeyCode.LeftShift, Enum.KeyCode.E, Enum.KeyCode.F,
+    Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four,
+}
+
+local Rec = {
+    Recording=false, Playing=false, Frames={}, Conn=nil,
+    PlayIdx=0, Repeating=false, RepeatCount=1, CurrentRep=0, PrevHeld={},
+}
+
+local function fireKey(down,kc)
+    pcall(function() VIM:SendKeyEvent(down,kc,false,game) end)
+end
+local function releaseAllKeys()
+    for _,kc in ipairs(WATCH_KEYS) do fireKey(false,kc) end
+    pcall(function()
+        local mp=UIS:GetMouseLocation()
+        VIM:SendMouseButtonEvent(mp.X,mp.Y,0,false,game,0)
+    end)
+end
+
+local recCard=card(REC_PAGE,2)
+addPad(recCard,8,8,8,8)
+addList(recCard,4)
+
+local recStatusLbl=lbl(recCard,{
+    Text="frames: 0  |  status: ready",
+    TextSize=10, TextColor3=C.sub,
+    Size=UDim2.new(1,0,0,14),
+    LayoutOrder=1,
+})
+
+local recBtnRow=frame(recCard,{
+    Size=UDim2.new(1,0,0,28), BackgroundTransparency=1, LayoutOrder=2,
+})
+local recBtnList=addList(recBtnRow,4,Enum.FillDirection.Horizontal)
+
+local function recBtn(parent,text,col,onClick)
+    local b=btn(parent,{
+        Text=text, TextSize=10, Font=Enum.Font.Code,
+        TextColor3=C.white, BackgroundColor3=col,
+        Size=UDim2.new(0.25,-3,1,0),
+        BorderSizePixel=0,
+    },onClick)
+    corner(b,4); return b
+end
+
+local recBtn_rec=recBtn(recBtnRow,"⏺ rec",C.red,nil)
+local recBtn_play=recBtn(recBtnRow,"▶ play",C.green,nil)
+local recBtn_rep=recBtn(recBtnRow,"🔁 loop",Color3.fromRGB(30,60,130),nil)
+local recBtn_clear=recBtn(recBtnRow,"✕ clr",C.mute,nil)
+
+recBtn_clear.MouseButton1Click:Connect(function()
+    Rec.Frames={}; Rec.PlayIdx=0
+    recStatusLbl.Text="frames: 0  |  status: cleared"
+end)
+
+recBtn_rec.MouseButton1Click:Connect(function()
+    if Rec.Recording then
+        Rec.Recording=false; if Rec.Conn then Rec.Conn:Disconnect(); Rec.Conn=nil end
+        recBtn_rec.Text="⏺ rec"; recBtn_rec.BackgroundColor3=C.red
+        recStatusLbl.Text="frames: "..#Rec.Frames.."  |  status: done"
+    else
+        Rec.Frames={}; Rec.Recording=true
+        recBtn_rec.Text="⏹ stop"; recBtn_rec.BackgroundColor3=C.orange
+        recStatusLbl.Text="frames: 0  |  status: recording..."
+        Rec.Conn=RunService.RenderStepped:Connect(function()
+            if not Rec.Recording then return end
+            local held={}
+            for _,kc in ipairs(WATCH_KEYS) do
+                held[tostring(kc)]=UIS:IsKeyDown(kc)
+            end
+            local mp=UIS:GetMouseLocation()
+            table.insert(Rec.Frames,{held=held,mx=mp.X,my=mp.Y,mb1=UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)})
+            recStatusLbl.Text="frames: "..#Rec.Frames.."  |  status: recording..."
+        end)
+    end
+end)
+
+recBtn_play.MouseButton1Click:Connect(function()
+    if #Rec.Frames==0 then return end
+    task.spawn(function()
+        for _,frame in ipairs(Rec.Frames) do
+            for kc_str,down in pairs(frame.held) do
+                local ok,kc=pcall(function() return Enum.KeyCode[kc_str:gsub("Enum.KeyCode.","")] end)
+                if ok and kc then fireKey(down,kc) end
+            end
+            if frame.mb1 then VIM:SendMouseButtonEvent(frame.mx,frame.my,0,true,game,0) end
+            task.wait(1/60)
+        end
+        releaseAllKeys()
+        recStatusLbl.Text="frames: "..#Rec.Frames.."  |  status: done"
+    end)
+end)
+
+recBtn_rep.MouseButton1Click:Connect(function()
+    if Rec.Repeating then
+        Rec.Repeating=false
+        recBtn_rep.BackgroundColor3=Color3.fromRGB(30,60,130)
+        recBtn_rep.Text="🔁 loop"
+    else
+        if #Rec.Frames==0 then return end
+        Rec.Repeating=true
+        recBtn_rep.BackgroundColor3=C.red
+        recBtn_rep.Text="⏹ stop"
+        task.spawn(function()
+            while Rec.Repeating do
+                for _,fr in ipairs(Rec.Frames) do
+                    if not Rec.Repeating then break end
+                    for kc_str,down in pairs(fr.held) do
+                        local ok,kc=pcall(function() return Enum.KeyCode[kc_str:gsub("Enum.KeyCode.","")] end)
+                        if ok and kc then fireKey(down,kc) end
+                    end
+                    task.wait(1/60)
+                end
+                releaseAllKeys(); task.wait(0.2)
+            end
+        end)
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- FLOATING BUTTON
+-- ══════════════════════════════════════════════════════════════
+local floatBtn=frame(SG,{
+    Name="FloatBtn",
+    Size=UDim2.new(0,34,0,34),
+    Position=UDim2.new(1,-50,0.5,-17),
+    BackgroundColor3=C.bg,
+    BorderSizePixel=1,
+    BorderColor3=C.acc,
+})
+corner(floatBtn,6)
+lbl(floatBtn,{
+    Text="c3",
+    TextSize=11, TextColor3=C.acc,
+    Size=UDim2.new(1,0,1,0),
+    TextXAlignment=Enum.TextXAlignment.Center,
+})
+local floatDragging=false; local floatOff=Vector2.new()
+floatBtn.InputBegan:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 then
+        -- try click vs drag
+        local startPos=inp.Position
+        task.spawn(function()
+            task.wait(0.12)
+            local mp=UIS:GetMouseLocation()
+            if (Vector2.new(startPos.X,startPos.Y)-mp).Magnitude<5 then
+                Main.Visible=not Main.Visible
+            end
+        end)
+        floatDragging=true
+        floatOff=Vector2.new(inp.Position.X-floatBtn.AbsolutePosition.X,inp.Position.Y-floatBtn.AbsolutePosition.Y)
+    end
+end)
+floatBtn.InputEnded:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 then floatDragging=false end
+end)
+RunService.RenderStepped:Connect(function()
+    if floatDragging then
+        local mp=UIS:GetMouseLocation(); local vp=Cam.ViewportSize
+        floatBtn.Position=UDim2.new(0,math.clamp(mp.X-floatOff.X,0,vp.X-34),0,math.clamp(mp.Y-floatOff.Y,0,vp.Y-34))
+    end
+end)
+
+-- ── INV REFRESH ───────────────────────────────────────────────
+lStatus = lStatus_main
+
+local function refreshInv()
+    local w=countInv("Water"); local s=countInv("Sugar Block Bag"); local g=countInv("Gelatin")
+    if miniStatLabels["inv_w"] then
+        miniStatLabels["inv_w"].Text=tostring(w)
+        miniStatLabels["inv_w"].TextColor3=w>0 and C.green or C.red
+    end
+    if miniStatLabels["inv_s"] then
+        miniStatLabels["inv_s"].Text=tostring(s)
+        miniStatLabels["inv_s"].TextColor3=s>0 and C.green or C.red
+    end
+    if miniStatLabels["inv_g"] then
+        miniStatLabels["inv_g"].Text=tostring(g)
+        miniStatLabels["inv_g"].TextColor3=g>0 and C.green or C.red
+    end
+end
+
+LP.Backpack.ChildAdded:Connect(function() task.wait(0.5); refreshInv() end)
+LP.Backpack.ChildRemoved:Connect(function() task.wait(0.8); refreshInv() end)
+task.spawn(function()
+    task.wait(0.5); refreshInv()
+    -- startup scan — count existing bags into batches only
+    local function scan(c) if not c then return end
+        for _,v in ipairs(c:GetChildren()) do
+            if v:IsA("Tool") then
+                local n=v.Name:lower()
+                if n:find("marshmallow") or n:find("marsh") then
+                    stats.batches+=1
+                end
+            end
+        end
+    end
+    scan(LP.Backpack)
+    if LP.Character then scan(LP.Character) end
+end)
+
+
+-- ── BETTER STAT UPDATE — direct refs ──────────────────────────
+-- Re-do statRow to return val label directly
+local function setStatLabel(key,val)
+    if statLabels[key] then statLabels[key].Text=tostring(val) end
+end
+
+-- Override live loop properly:
+task.spawn(function()
+    while SG.Parent do
+        local now=tick()
+        -- step bar
+        if stats.stepEnd then
+            local rem=math.max(0,stats.stepEnd-now)
+            local tot=math.max(stats.stepTotal,1)
+            local pct=math.clamp(1-rem/tot,0,1)
+            stepFill.Size=UDim2.new(pct,0,1,0)
+            stepLbl.Text=string.format("step: %.1fs",rem)
+            stepPct.Text=string.format("%d%%",math.floor(pct*100))
+            stepLbl.TextColor3=rem<5 and C.red or C.acc
+        else
+            stepFill.Size=UDim2.new(0,0,1,0)
+            stepLbl.Text="step: --"; stepPct.Text=""
+        end
+        -- cook
+        if stats.cookStart then
+            local e=math.floor(now-stats.cookStart)
+            setStatLabel("cooktime",string.format("%d:%02d",math.floor(e/60),e%60))
+        else setStatLabel("cooktime","--") end
+        -- avg
+        if stats.cookCount and stats.cookCount>0 then
+            local avg=math.floor(stats.totalCookSecs/stats.cookCount)
+            setStatLabel("avgcook",string.format("%d:%02d",math.floor(avg/60),avg%60))
+        else setStatLabel("avgcook","--") end
+        -- uptime
+        local s=math.floor(stats.farmUptime+(stats.farmStarted and now-stats.farmStarted or 0))
+        setStatLabel("uptime",string.format("%d:%02d",math.floor(s/60),s%60))
+        -- counts
+        setStatLabel("small",stats.small)
+        setStatLabel("medium",stats.medium)
+        setStatLabel("large",stats.large)
+        -- mini stats
+        if miniStatLabels["batches"] then miniStatLabels["batches"].Text=tostring(stats.batches) end
+        if miniStatLabels["earned"]  then miniStatLabels["earned"].Text="$"..tostring(stats.earned) end
+        if miniStatLabels["inbag"]   then miniStatLabels["inbag"].Text=tostring(countMarshmallowInv()) end
+        if miniStatLabels["failed"]  then miniStatLabels["failed"].Text=tostring(stats.failed) end
+        -- status badge
+        if farmEnabled then
+            titleBadge.BackgroundColor3=loopEnabled and Color3.fromRGB(20,40,100) or Color3.fromRGB(20,80,30)
+            titleBadgeLbl.Text=loopEnabled and "loop" or "farm"
+            titleBadgeLbl.TextColor3=loopEnabled and C.blue or C.green
+        else
+            titleBadge.BackgroundColor3=C.mute
+            titleBadgeLbl.Text="idle"
+            titleBadgeLbl.TextColor3=C.sub
+        end
+        -- push status to log on change
+        if lStatus_main.Text~=stats.status then
+            lStatus_main.Text=stats.status
+            pushLog(stats.status)
+        end
+        refreshInv()
+        task.wait(0.2)
+    end
+end)
+
+-- ── AUTO SELL toggle (was in old GUI) ─────────────────────────
+-- Hook into logBatch to push to new log
+local _origLogBatch=logBatch
+logBatch=function(size)
+    _origLogBatch(size)
+    pushLog("✓ got "..size:lower().." ms  ($"..PRICES[size]..")")
+end
+
+-- ── INIT ──────────────────────────────────────────────────────
+switchTab("farm")
+
+game:GetService("StarterGui"):SetCore("SendNotification",{
+    Title="[C3]", Text="AutoMS loaded", Duration=3,
+})

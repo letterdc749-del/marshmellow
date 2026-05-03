@@ -1028,6 +1028,38 @@ mkBtn(MAIN_PAGE,"return to cook spot",Color3.fromRGB(40,40,50),18,function()
     if savedCookPos then directTP(savedCookPos) else setStatus("no cook spot saved yet") end
 end)
 mkDiv(MAIN_PAGE,19)
+
+-- ── KICK ON EARNED ──────────────────────────────────────────────────────────
+mkLbl(MAIN_PAGE,"kick when earned reaches:",ACC,19.1)
+local kickFrame=Instance.new("Frame",MAIN_PAGE)
+kickFrame.Size=UDim2.new(1,0,0,28); kickFrame.BackgroundColor3=Color3.fromRGB(24,24,28)
+kickFrame.BorderSizePixel=1; kickFrame.BorderColor3=Color3.fromRGB(36,36,40); kickFrame.LayoutOrder=19.2
+local kickBox=Instance.new("TextBox",kickFrame)
+kickBox.Text=""; kickBox.PlaceholderText="e.g. 50000"
+kickBox.Font=Enum.Font.Code; kickBox.TextSize=11; kickBox.TextColor3=TXT; kickBox.PlaceholderColor3=MUTE
+kickBox.BackgroundTransparency=1; kickBox.Size=UDim2.new(1,-10,1,0); kickBox.Position=UDim2.new(0,5,0,0)
+kickBox.TextXAlignment=Enum.TextXAlignment.Left; kickBox.ClearTextOnFocus=false
+
+local kickEnabled = false
+local kickConn = nil
+mkToggle(MAIN_PAGE,"kick on earned",ACC,19.3,function(v)
+    kickEnabled = v
+    if v then
+        local baseEarned = stats.earned
+        kickConn = task.spawn(function()
+            while kickEnabled do
+                task.wait(1)
+                local target = tonumber(kickBox.Text) or 0
+                if target > 0 and (stats.earned - baseEarned) >= target then
+                    kickEnabled = false
+                    local earned = stats.earned - baseEarned
+                    game.Players.LocalPlayer:Kick("Money Earned 💵 Your earned "..tostring(earned).." money")
+                end
+            end
+        end)
+    end
+end)
+
 mkBtn(MAIN_PAGE,"reset stats",Color3.fromRGB(40,40,50),20,function()
     stats.batches=0; stats.small=0; stats.medium=0; stats.large=0
     stats.earned=0; stats.failed=0; stats.batchLog={}; stats.lastBatch=""

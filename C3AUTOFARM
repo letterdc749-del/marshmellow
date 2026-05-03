@@ -1053,7 +1053,9 @@ mkToggle(MAIN_PAGE,"kick on earned",ACC,19.3,function(v)
                 if target > 0 and (stats.earned - baseEarned) >= target then
                     kickEnabled = false
                     local earned = stats.earned - baseEarned
-                    game.Players.LocalPlayer:Kick("Money Earned 💵 Your earned "..tostring(earned).." money")
+                    local s = math.floor(stats.farmUptime + (stats.farmStarted and tick()-stats.farmStarted or 0))
+                    local uptime = string.format("%d:%02d", math.floor(s/60), s%60)
+                    game.Players.LocalPlayer:Kick("Money Earned 💵 Your earned "..tostring(earned).." money | Uptime: "..uptime)
                 end
             end
         end)
